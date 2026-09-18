@@ -1,0 +1,93 @@
+# Dependencies and build output
+node_modules/
+.next/
+out/
+dist/
+.turbo/
+*.tsbuildinfo
+
+# Local environment and deployment state
+.env*
+!.env.example
+.direnv/
+.dev.vars*
+.vercel/
+.netlify/
+.firebase/
+.wrangler/
+supabase/.temp/
+
+# Local credential stores and secret files
+.npmrc
+.pypirc
+.netrc
+_netrc
+.git-credentials
+.authinfo
+.authinfo.gpg
+secrets/
+credentials/
+credentials*.json
+service-account*.json
+service_account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+*.jks
+*.keystore
+*.mobileprovision
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# Local cloud-provider credentials
+.aws/
+.azure/
+.config/gcloud/
+
+# Python environments, bytecode, and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage and test output
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+playwright-report/
+test-results/
+
+# Generated corpus and local tooling
+data/corpus/
+.agents/
+.codex/
+.claude/
+.cursor/
+.continue/
+.history/
+.superpowers/
+.tools/
+docs/superpowers/
+tmp/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
