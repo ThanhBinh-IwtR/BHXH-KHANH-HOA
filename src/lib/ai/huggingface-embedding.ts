@@ -36,7 +36,11 @@ export class HuggingFaceEmbeddingClient implements EmbeddingClient {
     try {
       return await withTimeout(async (signal) => {
         const response = await this.fetchImpl(
-          huggingFaceModelEndpoint(this.options.baseUrl, this.options.model),
+          huggingFaceModelEndpoint(
+            this.options.baseUrl,
+            this.options.model,
+            'feature-extraction',
+          ),
           {
             method: 'POST',
             signal,

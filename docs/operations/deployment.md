@@ -40,8 +40,9 @@ corpus, không đại diện cho đủ bốn nghị định;
 memory repository không loại bỏ yêu cầu provider nếu muốn gọi `/api/chat` thật.
 
 Với Hugging Face Inference Providers, `EMBEDDING_BASE_URL` và `RERANKER_BASE_URL` là URL gốc của
-router (ví dụ `https://router.huggingface.co`); adapter tự thêm route task
-`/hf-inference/models/{model}`. Không dùng `/v1/embeddings` cho hai task này.
+router (ví dụ `https://router.huggingface.co`). Embedding dùng route
+`/hf-inference/models/{model}/pipeline/feature-extraction`; reranker dùng route model mặc định với
+cặp `text`/`text_pair`. Không dùng `/v1/embeddings` cho hai task này.
 
 Tối thiểu cho test/e2e memory (không cần Supabase):
 

@@ -390,7 +390,10 @@ def test_huggingface_provider_does_not_retry_a_permission_error() -> None:
     assert raised.value.status == 403
     assert "secret-token" not in str(raised.value)
     assert len(calls) == 1
-    assert calls[0].full_url == "https://router.huggingface.co/hf-inference/models/BAAI/bge-m3"
+    assert (
+        calls[0].full_url
+        == "https://router.huggingface.co/hf-inference/models/BAAI/bge-m3/pipeline/feature-extraction"
+    )
 
 
 def test_huggingface_provider_retries_a_loading_model_then_succeeds() -> None:

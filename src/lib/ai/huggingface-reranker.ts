@@ -49,7 +49,7 @@ export class HuggingFaceRerankerClient implements RerankerClient {
               authorization: `Bearer ${this.options.apiKey}`,
             },
             body: JSON.stringify({
-              inputs: { source_sentence: query, sentences: [...passages] },
+              inputs: passages.map((passage) => ({ text: query, text_pair: passage })),
             }),
           },
         );
@@ -59,10 +59,12 @@ export class HuggingFaceRerankerClient implements RerankerClient {
             retryAfterMs: parseRetryAfterMs(response.headers.get('retry-after')),
           });
         }
-        const payload = (await response.json()) as number[] | { score: number }[];
-        const scores = Array.isArray(payload)
-          ? payload.map((entry) => (typeof entry === 'number' ? entry : entry.score))
-          : [];
+        const payload = (await response.json()) as
+          | number
+          | { score: number }
+          | (number | { score: number })[];
+        const entries = Array.isArray(payload) ? payload : [payload];
+        const scores = entries.map((entry) => (typeof entry === 'number' ? entry : entry.score));
         if (scores.length !== passages.length) {
           throw new ProviderUnavailableError('Reranker response shape was invalid');
         }

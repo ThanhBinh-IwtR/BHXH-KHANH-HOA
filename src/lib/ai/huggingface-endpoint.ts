@@ -1,12 +1,17 @@
 import { stageTimeoutMs, type ProviderCallOptions } from './contracts';
 import type { TimeoutOptions } from './with-timeout';
 
-export function huggingFaceModelEndpoint(baseUrl: string, model: string): string {
+export function huggingFaceModelEndpoint(
+  baseUrl: string,
+  model: string,
+  task?: 'feature-extraction',
+): string {
   const normalizedBaseUrl = baseUrl.replace(/\/+$/, '');
   const inferenceBaseUrl = normalizedBaseUrl.endsWith('/hf-inference')
     ? normalizedBaseUrl
     : `${normalizedBaseUrl}/hf-inference`;
-  return `${inferenceBaseUrl}/models/${model}`;
+  const modelEndpoint = `${inferenceBaseUrl}/models/${model}`;
+  return task ? `${modelEndpoint}/pipeline/${task}` : modelEndpoint;
 }
 
 /**

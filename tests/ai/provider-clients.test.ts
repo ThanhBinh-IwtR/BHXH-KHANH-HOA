@@ -181,7 +181,7 @@ describe('HuggingFaceEmbeddingClient', () => {
     const vectors = await client.embed(['xin chào']);
     expect(vectors).toEqual([[0.1, 0.2]]);
     expect(fetchImpl).toHaveBeenCalledWith(
-      'https://router.example/hf-inference/models/BAAI/bge-m3',
+      'https://router.example/hf-inference/models/BAAI/bge-m3/pipeline/feature-extraction',
       expect.objectContaining({
         body: JSON.stringify({ inputs: ['xin chào'] }),
       }),
@@ -218,7 +218,12 @@ describe('HuggingFaceEmbeddingClient', () => {
 
 describe('HuggingFaceRerankerClient', () => {
   it('calls the Hugging Face task endpoint and returns a score per passage', async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse([0.9, 0.1]));
+    const fetchImpl = vi.fn().mockResolvedValue(
+      jsonResponse([
+        { label: 'LABEL_0', score: 0.9 },
+        { label: 'LABEL_0', score: 0.1 },
+      ]),
+    );
     const client = new HuggingFaceRerankerClient({
       baseUrl: 'https://router.example',
       apiKey: 'k',
@@ -232,10 +237,28 @@ describe('HuggingFaceRerankerClient', () => {
       'https://router.example/hf-inference/models/BAAI/bge-reranker-v2-m3',
       expect.objectContaining({
         body: JSON.stringify({
-          inputs: { source_sentence: 'q', sentences: ['a', 'b'] },
+          inputs: [
+            { text: 'q', text_pair: 'a' },
+            { text: 'q', text_pair: 'b' },
+          ],
         }),
       }),
     );
+  });
+
+  it('accepts the singleton object returned for one text pair', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ label: 'LABEL_0', score: 0.75 }));
+    const client = new HuggingFaceRerankerClient({
+      baseUrl: 'https://router.example',
+      apiKey: 'k',
+      model: 'BAAI/bge-reranker-v2-m3',
+      timeoutMs: 1000,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    await expect(client.rerank('q', ['a'])).resolves.toEqual([0.75]);
   });
 
   it('opens a session circuit after a reranker permission error', async () => {

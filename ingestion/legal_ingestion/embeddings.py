@@ -100,7 +100,7 @@ def huggingface_model_endpoint(base_url: str, model: str) -> str:
     normalized = base_url.rstrip("/")
     if not normalized.endswith("/hf-inference"):
         normalized = f"{normalized}/hf-inference"
-    return f"{normalized}/models/{model}"
+    return f"{normalized}/models/{model}/pipeline/feature-extraction"
 
 
 def parse_embedding_payload(payload: object, input_count: int) -> list[list[float]] | None:
