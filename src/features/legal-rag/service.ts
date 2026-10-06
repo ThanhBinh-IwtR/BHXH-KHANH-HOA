@@ -1,16 +1,19 @@
 import { z } from 'zod';
 
-import type { EmbeddingClient, LlmClient, RerankerClient } from '@/lib/ai/contracts';
-import { InvalidModelOutputError, ProviderUnavailableError } from '@/lib/ai/errors';
+import type { EmbeddingClient, LlmClient, LlmUsage, RerankerClient } from '@/lib/ai/contracts';
+import {
+  InvalidModelOutputError,
+  ModelOutputTruncatedError,
+  ProviderUnavailableError,
+} from '@/lib/ai/errors';
 import type { LegalRepository } from '@/lib/db/legal-repository';
 
 import type { ModelAnswer } from './answer-schema';
 import { generateAnswer } from './answer-generator';
-import { ensureGroundedAnswerDepth } from './answer-depth';
-import { validateAnswer } from './answer-validator';
-import { SAFE_FALLBACK, verifyAnswer } from './answer-verifier';
+import { SAFE_FALLBACK, verifyAnswerWithReport } from './answer-verifier';
 import { buildContext, type ContextBudget } from './context-builder';
 import { buildPublicResponse, type PublicResponse } from './public-response';
+import { createRequestBudget, type RequestBudget } from './request-budget';
 import { retrieveEvidence } from './retrieval';
 import type { VerifiedAnswer } from './types';
 import { parseLegalReference, type LegalReference } from './query-parser';
@@ -37,7 +40,10 @@ export interface RagServiceDeps {
   generator: LlmClient;
   corpusVersion: string;
   contextBudget?: ContextBudget;
-  /** Total orchestration budget. Provider adapters retain their own shorter stage timeout. */
+  /**
+   * Total orchestration budget. It is split between stages: embedding and
+   * reranking are capped, generation receives the remainder.
+   */
   requestTimeoutMs?: number;
 }
 
@@ -51,9 +57,15 @@ export interface RagStageTimings {
 
 export type RagStage = 'retrieval' | 'context' | 'generation' | 'verification' | 'orchestration';
 
+/** Stages reported to the client as real progress milestones. */
+export type RagProgressStage = Exclude<RagStage, 'orchestration'>;
+
 export interface RagFailureDiagnostics {
   stage: RagStage;
   stageTimings: RagStageTimings;
+  /** Non-sensitive failure class, e.g. `output_truncated`. */
+  reason?: string;
+  metrics?: RagMetrics;
 }
 
 export interface RagOutcome {
@@ -68,10 +80,16 @@ export interface RagMetrics {
   llmCallCount: number;
   rejectedClaimCount: number;
   downgradeReasons: readonly string[];
+  /** Provider stop reason of the generator call (`stop`, `length`, ...), when reported. */
+  finishReason?: string | null;
+  /** Provider-reported completion tokens of the generator call, when reported. */
+  completionTokens?: number | null;
 }
 
 export interface RagRunOptions {
   signal?: AbortSignal;
+  /** Called when the pipeline enters a stage; used for real progress events. */
+  onStage?: (stage: RagProgressStage) => void;
 }
 
 const OUT_OF_SCOPE: VerifiedAnswer = SAFE_FALLBACK;
@@ -97,10 +115,18 @@ export function resolveStandaloneQuestion(
 
 const EMPTY_CONTEXT = { sources: [], sourceIds: [], contextText: '', tokenEstimate: 0 } as const;
 
+interface MutableMetrics {
+  llmCallCount: number;
+  rejectedClaimCount: number;
+  downgradeReasons: string[];
+  finishReason?: string | null;
+  completionTokens?: number | null;
+}
+
 /**
  * Orchestrate one turn:
  *   validate -> resolve standalone -> retrieve -> build context ->
- *   generate -> deterministic validate -> deterministic verification -> public response.
+ *   generate -> deterministic verification -> public response.
  * Any stage without acceptable evidence returns a bounded out_of_scope answer.
  */
 export async function runRag(
@@ -110,8 +136,9 @@ export async function runRag(
 ): Promise<RagOutcome> {
   const timeoutMs = deps.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const started = Date.now();
+  const budget = createRequestBudget(timeoutMs);
   return withRequestDeadline(
-    (signal) => runRagWithinBudget(request, deps, signal),
+    (signal) => runRagWithinBudget(request, deps, signal, budget, options.onStage),
     timeoutMs,
     options.signal,
   ).catch((error: unknown) => {
@@ -129,6 +156,8 @@ async function runRagWithinBudget(
   request: ChatRequest,
   deps: RagServiceDeps,
   signal: AbortSignal,
+  budget: RequestBudget,
+  onStage: RagRunOptions['onStage'],
 ): Promise<RagOutcome> {
   const started = Date.now();
   const stageTimings: Omit<RagStageTimings, 'totalMs'> = {
@@ -137,10 +166,13 @@ async function runRagWithinBudget(
     generationMs: 0,
     verificationMs: 0,
   };
-  const metrics: { llmCallCount: number; rejectedClaimCount: number; downgradeReasons: string[] } = {
+  const metrics: MutableMetrics = {
     llmCallCount: 0,
     rejectedClaimCount: 0,
     downgradeReasons: [],
+  };
+  const enter = (stage: RagProgressStage) => {
+    if (!signal.aborted) onStage?.(stage);
   };
   const standalone = resolveStandaloneQuestion(request.message, request.history);
   const clarification = buildClarificationPreflight(standalone);
@@ -165,6 +197,7 @@ async function runRagWithinBudget(
     );
   }
 
+  enter('retrieval');
   const retrievalStarted = Date.now();
   let evidence;
   try {
@@ -173,7 +206,7 @@ async function runRagWithinBudget(
       deps.repository,
       deps.embedder,
       deps.reranker,
-      { signal },
+      { signal, budget },
     );
     throwIfAborted(signal);
   } catch (error) {
@@ -195,10 +228,11 @@ async function runRagWithinBudget(
     );
   }
 
+  enter('context');
   const contextStarted = Date.now();
   let context;
   try {
-    context = await buildContext(evidence, deps.repository, deps.contextBudget);
+    context = await buildContext(evidence, deps.repository, deps.contextBudget, { signal });
     throwIfAborted(signal);
   } catch (error) {
     stageTimings.contextMs = Date.now() - contextStarted;
@@ -217,13 +251,44 @@ async function runRagWithinBudget(
     );
   }
 
+  // Generation receives every millisecond that is left, minus a small reserve
+  // for verification. If nothing is left, fail now with a classified timeout
+  // instead of starting a provider call that cannot finish.
+  const generationBudgetMs = budget.generationMs();
+  if (generationBudgetMs <= 0) {
+    const error = new ProviderUnavailableError('RAG request exceeded its total time budget');
+    annotateFailure(error, 'generation', stageTimings, started, {
+      reason: 'generation_skipped_budget',
+      metrics,
+    });
+    throw error;
+  }
+
+  enter('generation');
   const generationStarted = Date.now();
   metrics.llmCallCount += 1;
   let model: ModelAnswer;
   try {
-    model = await generateAnswer(standalone, context, deps.generator, { signal });
+    model = await generateAnswer(standalone, context, deps.generator, {
+      signal,
+      timeoutMs: generationBudgetMs,
+      onUsage: (usage: LlmUsage) => {
+        metrics.finishReason = usage.finishReason;
+        metrics.completionTokens = usage.completionTokens;
+      },
+    });
   } catch (error) {
     stageTimings.generationMs = Date.now() - generationStarted;
+    if (error instanceof ModelOutputTruncatedError) {
+      // A cut-off answer is a length problem, not missing evidence: surface a
+      // retryable error rather than the out-of-scope fallback.
+      metrics.downgradeReasons.push('output_truncated');
+      annotateFailure(error, 'generation', stageTimings, started, {
+        reason: 'output_truncated',
+        metrics,
+      });
+      throw error;
+    }
     annotateFailure(error, 'generation', stageTimings, started);
     if (!(error instanceof InvalidModelOutputError)) throw error;
     metrics.downgradeReasons.push('invalid_model_output');
@@ -237,83 +302,12 @@ async function runRagWithinBudget(
   }
   throwIfAborted(signal);
   stageTimings.generationMs = Date.now() - generationStarted;
-  const validation = validateAnswer(model, context);
-  const invalidClaimIndexes = new Set(
-    validation.issues
-      .filter((issue) => issue.claimIndex >= 0)
-      .map((issue) => issue.claimIndex),
-  );
-  metrics.rejectedClaimCount = invalidClaimIndexes.size;
-  metrics.downgradeReasons.push(
-    ...new Set(validation.issues.map((issue) => `validator_${issue.code.toLowerCase()}`)),
-  );
 
-  if (validation.issues.some((issue) => issue.code === 'INVALID_SHORT_ANSWER')) {
-    metrics.downgradeReasons.push('invalid_short_answer');
-    return finishOutcome(
-      buildPublicResponse(SAFE_FALLBACK, context),
-      evidence.chunks.length,
-      stageTimings,
-      started,
-      metrics,
-    );
-  }
-
-  let candidate: ModelAnswer = model;
-  if (!validation.ok) {
-    const analysis = model.analysis.filter((_claim, index) => !invalidClaimIndexes.has(index));
-    if (model.scope_status === 'grounded' && analysis.length === 0) {
-      metrics.downgradeReasons.push('no_supported_claims');
-      return finishOutcome(
-        buildPublicResponse(SAFE_FALLBACK, context),
-        evidence.chunks.length,
-        stageTimings,
-        started,
-        metrics,
-      );
-    }
-    candidate = { ...model, analysis };
-  }
-
-  // Validation may remove an unsupported claim after generation. Apply the
-  // model-free depth policy to the surviving answer as well, so the public
-  // response cannot regress to a shallow two-claim answer. The policy only
-  // adds source-backed formula explanations and never calls another model.
-  candidate = ensureGroundedAnswerDepth(candidate, context, standalone);
-  const depthValidation = validateAnswer(candidate, context);
-  const depthInvalidClaimIndexes = new Set(
-    depthValidation.issues
-      .filter((issue) => issue.claimIndex >= 0)
-      .map((issue) => issue.claimIndex),
-  );
-  if (depthInvalidClaimIndexes.size > 0) {
-    metrics.rejectedClaimCount += depthInvalidClaimIndexes.size;
-    metrics.downgradeReasons.push(
-      ...new Set(depthValidation.issues.map((issue) => `validator_${issue.code.toLowerCase()}`)),
-    );
-    candidate = {
-      ...candidate,
-      analysis: candidate.analysis.filter((_claim, index) => !depthInvalidClaimIndexes.has(index)),
-    };
-  }
-  if (
-    depthValidation.issues.some((issue) => issue.code === 'INVALID_SHORT_ANSWER') ||
-    (candidate.scope_status === 'grounded' && candidate.analysis.length === 0)
-  ) {
-    metrics.downgradeReasons.push('no_supported_claims');
-    return finishOutcome(
-      buildPublicResponse(SAFE_FALLBACK, context),
-      evidence.chunks.length,
-      stageTimings,
-      started,
-      metrics,
-    );
-  }
-
+  enter('verification');
   const verificationStarted = Date.now();
-  let verified;
+  let verification;
   try {
-    verified = verifyAnswer(candidate, context);
+    verification = verifyAnswerWithReport(model, context, standalone);
     throwIfAborted(signal);
   } catch (error) {
     stageTimings.verificationMs = Date.now() - verificationStarted;
@@ -321,7 +315,9 @@ async function runRagWithinBudget(
     throw error;
   }
   stageTimings.verificationMs = Date.now() - verificationStarted;
-  const canonicalVerified = canonicalizeExplicitReference(verified, standalone, context);
+  metrics.rejectedClaimCount = verification.rejectedClaimCount;
+  metrics.downgradeReasons.push(...verification.reasons);
+  const canonicalVerified = canonicalizeExplicitReference(verification.answer, standalone, context);
   return finishOutcome(
     buildPublicResponse(canonicalVerified, context),
     evidence.chunks.length,
@@ -383,22 +379,30 @@ function formatLegalReference(reference: LegalReference): string {
   return `${coordinates.join(' ')} Nghị định ${reference.documentNumber}`;
 }
 
+function snapshotMetrics(metrics: MutableMetrics): RagMetrics {
+  return {
+    llmCallCount: metrics.llmCallCount,
+    rejectedClaimCount: metrics.rejectedClaimCount,
+    downgradeReasons: [...new Set(metrics.downgradeReasons)],
+    ...(metrics.finishReason !== undefined ? { finishReason: metrics.finishReason } : {}),
+    ...(metrics.completionTokens !== undefined
+      ? { completionTokens: metrics.completionTokens }
+      : {}),
+  };
+}
+
 function finishOutcome(
   response: PublicResponse,
   retrievalCount: number,
   stageTimings: Omit<RagStageTimings, 'totalMs'>,
   started: number,
-  metrics: RagMetrics,
+  metrics: MutableMetrics,
 ): RagOutcome {
   return {
     response,
     retrievalCount,
     stageTimings: { ...stageTimings, totalMs: Date.now() - started },
-    metrics: {
-      llmCallCount: metrics.llmCallCount,
-      rejectedClaimCount: metrics.rejectedClaimCount,
-      downgradeReasons: [...new Set(metrics.downgradeReasons)],
-    },
+    metrics: snapshotMetrics(metrics),
   };
 }
 
@@ -414,6 +418,7 @@ function annotateFailure(
   stage: RagStage,
   stageTimings: Omit<RagStageTimings, 'totalMs'>,
   started: number,
+  detail: { reason?: string; metrics?: MutableMetrics } = {},
 ): void {
   if (!error || typeof error !== 'object' || getRagFailureDiagnostics(error)) return;
   Object.defineProperty(error, RAG_FAILURE_DIAGNOSTICS, {
@@ -422,6 +427,8 @@ function annotateFailure(
     value: {
       stage,
       stageTimings: { ...stageTimings, totalMs: Date.now() - started },
+      ...(detail.reason ? { reason: detail.reason } : {}),
+      ...(detail.metrics ? { metrics: snapshotMetrics(detail.metrics) } : {}),
     } satisfies RagFailureDiagnostics,
   });
 }
@@ -440,7 +447,6 @@ function buildClarificationPreflight(question: string): VerifiedAnswer | null {
         'Để xác định mức đóng chính xác, cần biết bạn thuộc nhóm đối tượng tham gia nào.',
       shortAnswerSourceIds: [],
       analysis: [],
-      aiSupplement: null,
       missingInformation: ['Nhóm đối tượng tham gia'],
       followUpQuestion: 'Bạn thuộc nhóm đối tượng nào?',
     };
@@ -453,7 +459,6 @@ function buildClarificationPreflight(question: string): VerifiedAnswer | null {
         'Để xác định mức đóng chính xác, cần biết bạn đang hỏi loại bảo hiểm nào.',
       shortAnswerSourceIds: [],
       analysis: [],
-      aiSupplement: null,
       missingInformation: ['Loại bảo hiểm đang được hỏi'],
       followUpQuestion: 'Bạn đang hỏi BHXH bắt buộc hay tự nguyện?',
     };
@@ -469,7 +474,6 @@ function buildClarificationPreflight(question: string): VerifiedAnswer | null {
       'Để trả lời chính xác, cần làm rõ loại bảo hiểm, nhóm đối tượng hoặc hoàn cảnh áp dụng.',
     shortAnswerSourceIds: [],
     analysis: [],
-    aiSupplement: null,
     missingInformation: ['Loại bảo hiểm, nhóm đối tượng hoặc hoàn cảnh áp dụng'],
     followUpQuestion: 'Bạn đang hỏi về loại bảo hiểm hoặc nhóm đối tượng nào?',
   };

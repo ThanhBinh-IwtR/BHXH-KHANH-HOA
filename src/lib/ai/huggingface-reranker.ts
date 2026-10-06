@@ -1,6 +1,6 @@
 import type { ProviderCallOptions, RerankerClient } from './contracts';
 import { getProviderStatus, ProviderUnavailableError } from './errors';
-import { huggingFaceModelEndpoint } from './huggingface-endpoint';
+import { huggingFaceModelEndpoint, huggingFaceStageOptions } from './huggingface-endpoint';
 import { parseRetryAfterMs, withTimeout } from './with-timeout';
 
 export interface HuggingFaceRerankerOptions {
@@ -67,7 +67,7 @@ export class HuggingFaceRerankerClient implements RerankerClient {
           throw new ProviderUnavailableError('Reranker response shape was invalid');
         }
         return scores;
-      }, { timeoutMs: this.options.timeoutMs, signal: callOptions.signal });
+      }, huggingFaceStageOptions(this.options.timeoutMs, callOptions));
     } catch (error) {
       const status = getProviderStatus(error);
       if (status === 401 || status === 403) this.disabledStatus = status;

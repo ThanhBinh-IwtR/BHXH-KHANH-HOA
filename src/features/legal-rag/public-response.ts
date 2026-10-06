@@ -27,7 +27,6 @@ export interface PublicResponse {
   shortAnswer: string;
   shortAnswerCitations?: Citation[];
   analysis: PublicClaim[];
-  aiSupplement: string | null;
   missingInformation: string[];
   followUpQuestion: string | null;
   sources: PublicSource[];
@@ -79,7 +78,6 @@ export function buildPublicResponse(
     shortAnswer: verified.shortAnswer,
     shortAnswerCitations,
     analysis,
-    aiSupplement: verified.aiSupplement,
     missingInformation: [...verified.missingInformation],
     followUpQuestion: verified.followUpQuestion,
     sources,

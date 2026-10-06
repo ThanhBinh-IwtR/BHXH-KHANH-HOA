@@ -20,7 +20,6 @@ const validAnswer = {
   scope_status: 'grounded',
   short_answer: 'Có căn cứ.',
   analysis: [{ claim: 'Quy định áp dụng.', source_ids: ['a'] }],
-  ai_supplement: null,
   missing_information: [],
   follow_up_question: null,
 };
@@ -40,24 +39,6 @@ const rateContext: BuiltContext = {
   sourceIds: ['bhyt-rate'],
   contextText: '[bhyt-rate] Mức đóng bảo hiểm y tế hằng tháng ...',
   tokenEstimate: 30,
-};
-
-const mixedRateContext: BuiltContext = {
-  sources: [
-    {
-      chunkId: 'bhxh-rate',
-      documentNumber: '158/2025/NĐ-CP',
-      label: '158/2025/NĐ-CP · Điều 12 · Khoản 1',
-      bodyText:
-        'Người lao động hằng tháng đóng bằng 8% mức tiền lương làm căn cứ đóng bảo hiểm xã hội bắt buộc vào quỹ hưu trí và tử tuất.',
-      pageFrom: 8,
-      pageTo: 8,
-    },
-    ...rateContext.sources,
-  ],
-  sourceIds: ['bhxh-rate', ...rateContext.sourceIds],
-  contextText: '[bhxh-rate] ... [bhyt-rate] ...',
-  tokenEstimate: 50,
 };
 
 describe('generateAnswer', () => {
@@ -81,126 +62,24 @@ describe('generateAnswer', () => {
     expect(GENERATION_SYSTEM_PROMPT).not.toContain('tối đa 3 mệnh đề');
   });
 
-  it('adds source-backed depth when the provider returns a shallow rate answer', async () => {
-    const llm = new FakeLlm([
-      {
-        scope_status: 'grounded',
-        short_answer: 'Mức đóng bảo hiểm y tế là 4,5%.',
-        analysis: [{ claim: 'Mức đóng bảo hiểm y tế là 4,5%.', source_ids: ['bhyt-rate'] }],
-        ai_supplement: null,
-        missing_information: [],
-        follow_up_question: null,
-      },
-    ]);
+  it('removes the never-displayed ai_supplement field from the prompt contract', () => {
+    expect(GENERATION_SYSTEM_PROMPT).not.toContain('ai_supplement');
+  });
 
+  it('returns the parsed model answer without depth enrichment (verification owns it)', async () => {
+    const shallow = {
+      scope_status: 'grounded',
+      short_answer: 'Mức đóng bảo hiểm y tế là 4,5%.',
+      analysis: [{ claim: 'Mức đóng bảo hiểm y tế là 4,5%.', source_ids: ['bhyt-rate'] }],
+      missing_information: [],
+      follow_up_question: null,
+    };
     const answer = await generateAnswer(
       'Mức đóng bảo hiểm y tế hằng tháng là bao nhiêu?',
       rateContext,
-      llm,
+      new FakeLlm([shallow]),
     );
-
-    expect(answer.analysis).toHaveLength(3);
-    expect(answer.analysis.map((claim) => claim.claim).join(' ')).toMatch(/công thức|tính/i);
-    expect(answer.analysis.map((claim) => claim.claim).join(' ')).not.toMatch(
-      /Mức đóng bảo hiểm y tế là 4,5%\./i,
-    );
-    expect(answer.short_answer).toMatch(/số tiền cụ thể|căn cứ/i);
-    expect(answer.analysis.every((claim) => claim.source_ids.length > 0)).toBe(true);
-  });
-
-  it('adds practical depth when three provider claims are still repetitive', async () => {
-    const llm = new FakeLlm([
-      {
-        scope_status: 'grounded',
-        short_answer:
-          'Mức đóng bảo hiểm y tế hằng tháng bằng 4,5% mức tiền lương làm căn cứ đóng bảo hiểm y tế.',
-        analysis: [
-          {
-            claim: 'Mức đóng bảo hiểm y tế được quy định tại Điều 7 Khoản 1.',
-            source_ids: ['bhyt-rate'],
-          },
-          {
-            claim: 'Tỷ lệ đóng bảo hiểm y tế là 4,5%.',
-            source_ids: ['bhyt-rate'],
-          },
-          {
-            claim: 'Tiền lương làm căn cứ đóng là cơ sở xác định số tiền đóng.',
-            source_ids: ['bhyt-rate'],
-          },
-        ],
-        ai_supplement: null,
-        missing_information: [],
-        follow_up_question: null,
-      },
-    ]);
-
-    const answer = await generateAnswer(
-      'Mức đóng bảo hiểm y tế hằng tháng là bao nhiêu?',
-      rateContext,
-      llm,
-    );
-
-    expect(answer.short_answer).toMatch(/số tiền thực tế|căn cứ/i);
-    const analysisText = answer.analysis.map((claim) => claim.claim).join(' ');
-    expect(analysisText).toMatch(/công thức/i);
-    expect(analysisText).not.toMatch(/được quy định tại Điều/i);
-  });
-
-  it('never borrows a rate from an unrelated source in a mixed context', async () => {
-    const llm = new FakeLlm([
-      {
-        scope_status: 'grounded',
-        short_answer: 'Mức đóng bảo hiểm y tế hằng tháng bằng 4,5%.',
-        analysis: [
-          {
-            claim: 'Mức đóng bảo hiểm y tế là 4,5%.',
-            source_ids: ['bhyt-rate'],
-          },
-        ],
-        ai_supplement: null,
-        missing_information: [],
-        follow_up_question: null,
-      },
-    ]);
-
-    const answer = await generateAnswer(
-      'Mức đóng bảo hiểm y tế hằng tháng là bao nhiêu?',
-      mixedRateContext,
-      llm,
-    );
-
-    const text = [answer.short_answer, ...answer.analysis.map((claim) => claim.claim)].join(' ');
-    expect(text).toContain('4,5%');
-    expect(text).not.toContain('8%');
-    expect(answer.analysis.every((claim) => claim.source_ids.includes('bhyt-rate'))).toBe(true);
-  });
-
-  it('keeps partial status while adding source-backed depth to a partial rate answer', async () => {
-    const llm = new FakeLlm([
-      {
-        scope_status: 'partial',
-        short_answer: 'Nguồn hiện có nêu mức đóng bảo hiểm y tế là 4,5%.',
-        analysis: [
-          {
-            claim: 'Mức đóng bảo hiểm y tế là 4,5%.',
-            source_ids: ['bhyt-rate'],
-          },
-        ],
-        ai_supplement: null,
-        missing_information: ['Mức tiền lương làm căn cứ'],
-        follow_up_question: 'Mức tiền lương làm căn cứ là bao nhiêu?',
-      },
-    ]);
-
-    const answer = await generateAnswer(
-      'Mức đóng bảo hiểm y tế hằng tháng là bao nhiêu?',
-      rateContext,
-      llm,
-    );
-
-    expect(answer.scope_status).toBe('partial');
-    expect(answer.analysis.length).toBeGreaterThanOrEqual(3);
-    expect(answer.analysis.map((claim) => claim.claim).join(' ')).toMatch(/công thức|tính/i);
+    expect(answer).toEqual(shallow);
   });
 
   it('returns a valid answer on the first attempt', async () => {

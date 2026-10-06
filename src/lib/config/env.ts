@@ -8,6 +8,12 @@ const legalRepositorySchema = z.enum(['memory', 'supabase']).default('memory');
 const rateLimitMaxSchema = z.coerce.number().int().min(1).max(1_000).default(20);
 const rateLimitWindowSchema = z.coerce.number().int().min(1_000).max(3_600_000).default(60_000);
 const requestTimeoutSchema = z.coerce.number().int().min(1_000).max(60_000).default(25_000);
+/**
+ * One provider stage may use at most 60% of the request budget: embedding and
+ * reranking are each capped at 15%, so a full-length generation still leaves
+ * about 10% headroom before the request deadline.
+ */
+const MAX_PROVIDER_TIMEOUT_SHARE = 0.6;
 
 const serverEnvSchema = z
   .object({
@@ -33,6 +39,14 @@ const serverEnvSchema = z
     RATE_LIMIT_SALT: requiredText,
   })
   .superRefine((env, ctx) => {
+    const maxProviderTimeoutMs = Math.floor(env.REQUEST_TIMEOUT_MS * MAX_PROVIDER_TIMEOUT_SHARE);
+    if (env.AI_TIMEOUT_MS > maxProviderTimeoutMs) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['AI_TIMEOUT_MS'],
+        message: `AI_TIMEOUT_MS (${env.AI_TIMEOUT_MS}) must be at most 60% of REQUEST_TIMEOUT_MS (${env.REQUEST_TIMEOUT_MS}), i.e. <= ${maxProviderTimeoutMs}`,
+      });
+    }
     // Supabase credentials are only required when it is the active repository;
     // memory mode (default) boots without them.
     if (env.LEGAL_REPOSITORY === 'supabase') {

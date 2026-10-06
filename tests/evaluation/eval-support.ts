@@ -21,7 +21,6 @@ export class EchoingLlm implements LlmClient {
         scope_status: 'partial',
         short_answer: 'Nguồn hiện có chỉ xác nhận một phần nội dung câu hỏi.',
         analysis: [{ claim: 'Nguồn được cung cấp có nêu quy định liên quan.', source_ids: [ids[0]] }],
-        ai_supplement: null,
         missing_information: ['Phần điều kiện còn lại cần đối chiếu'],
         follow_up_question: 'Bạn có thể bổ sung dữ kiện hoặc đối chiếu phần còn lại với văn bản chính thức?',
       } as T;
@@ -31,7 +30,6 @@ export class EchoingLlm implements LlmClient {
         scope_status: 'needs_clarification',
         short_answer: 'Cần thêm thông tin để trả lời chính xác.',
         analysis: [],
-        ai_supplement: null,
         missing_information: ['Nhóm đối tượng tham gia'],
         follow_up_question: 'Bạn thuộc nhóm đối tượng nào?',
       } as T;
@@ -41,7 +39,6 @@ export class EchoingLlm implements LlmClient {
         scope_status: 'needs_clarification',
         short_answer: 'Cần thêm thông tin để trả lời chính xác.',
         analysis: [],
-        ai_supplement: null,
         missing_information: ['Loại bảo hiểm'],
         follow_up_question: 'Bạn đang hỏi BHXH bắt buộc hay tự nguyện?',
       } as T;
@@ -51,7 +48,6 @@ export class EchoingLlm implements LlmClient {
         scope_status: 'out_of_scope',
         short_answer: 'Không có căn cứ trong bộ tài liệu.',
         analysis: [],
-        ai_supplement: null,
         missing_information: [],
         follow_up_question: null,
       } as T;
@@ -60,7 +56,6 @@ export class EchoingLlm implements LlmClient {
       scope_status: 'grounded',
       short_answer: 'Mức đóng được quy định trong nguồn dẫn chiếu.',
       analysis: [{ claim: 'Quy định về mức đóng được nêu tại nguồn.', source_ids: [ids[0]] }],
-      ai_supplement: null,
       missing_information: [],
       follow_up_question: null,
     } as T;

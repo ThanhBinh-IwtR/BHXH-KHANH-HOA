@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from typing import Sequence
 
 from pydantic import BaseModel, ConfigDict
@@ -41,6 +42,7 @@ def resolve_cross_references(
     """Extract and resolve explicit references within the same document/corpus."""
     resolved: list[CrossReference] = []
     unresolved: list[CrossReference] = []
+    index = _ArticleIndex(chunks)
     for source in chunks:
         occupied: list[tuple[int, int]] = []
         for pattern in REFERENCE_PATTERNS:
@@ -58,7 +60,7 @@ def resolve_cross_references(
                 target = None
                 if not _looks_like_external_document_reference(source.body_text, match.end()):
                     target = _find_target(
-                        chunks,
+                        index,
                         source=source,
                         article=article,
                         clause=clause,
@@ -92,21 +94,52 @@ def _looks_like_external_document_reference(text: str, match_end: int) -> bool:
     )
 
 
-def _find_target(
+def attach_cross_reference_ids(
     chunks: Sequence[LegalChunkRecord],
+    resolution: CrossReferenceResolution,
+) -> list[LegalChunkRecord]:
+    """Record each chunk's resolved targets so context expansion can use them."""
+    targets: dict[str, list[str]] = defaultdict(list)
+    for reference in resolution.resolved:
+        target = reference.target_chunk_id
+        if (
+            target is None
+            or target == reference.source_chunk_id
+            or target in targets[reference.source_chunk_id]
+        ):
+            continue
+        targets[reference.source_chunk_id].append(target)
+    return [
+        chunk.model_copy(update={"cross_reference_ids": tuple(targets.get(chunk.chunk_id, ()))})
+        for chunk in chunks
+    ]
+
+
+class _ArticleIndex:
+    """Chunks grouped by (document, corpus version, article), in input order."""
+
+    def __init__(self, chunks: Sequence[LegalChunkRecord]) -> None:
+        self._groups: dict[tuple[str, str, str], list[LegalChunkRecord]] = defaultdict(list)
+        for chunk in chunks:
+            key = (chunk.document_id, chunk.corpus_version, (chunk.article_number or "").lower())
+            self._groups[key].append(chunk)
+
+    def candidates(
+        self, source: LegalChunkRecord, article: str | None
+    ) -> Sequence[LegalChunkRecord]:
+        key = (source.document_id, source.corpus_version, (article or "").lower())
+        return self._groups.get(key, ())
+
+
+def _find_target(
+    index: _ArticleIndex,
     *,
     source: LegalChunkRecord,
     article: str | None,
     clause: str | None,
     point: str | None,
 ) -> LegalChunkRecord | None:
-    for candidate in chunks:
-        if (
-            candidate.document_id != source.document_id
-            or candidate.corpus_version != source.corpus_version
-            or (candidate.article_number or "").lower() != (article or "").lower()
-        ):
-            continue
+    for candidate in index.candidates(source, article):
         if clause is not None and candidate.clause_number != clause:
             continue
         if point is not None and not _contains_point(candidate, point.lower()):

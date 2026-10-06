@@ -1,45 +1,64 @@
 import { useEffect, useState } from 'react';
 
-import type { ChatProgress } from '../chat-types';
+import type { ChatProgress, ChatStage } from '../chat-types';
 
-const PROGRESS_MESSAGES = [
-  'Đang tiếp nhận câu hỏi…',
-  'Đang phân tích nội dung…',
-  'Đang tìm căn cứ phù hợp…',
-  'Đang đối chiếu các quy định…',
-  'Đang kiểm tra độ chính xác…',
-  'Đang hoàn thiện câu trả lời…',
-] as const;
+/** Labels for the real pipeline milestones streamed by the server. */
+const STAGE_MESSAGES: Record<ChatStage, string> = {
+  retrieval: 'Đang tìm căn cứ phù hợp…',
+  context: 'Đang đối chiếu các quy định liên quan…',
+  generation: 'Đang soạn câu trả lời từ căn cứ…',
+  verification: 'Đang kiểm tra căn cứ của câu trả lời…',
+};
 
-const PROGRESS_INTERVAL_MS = 4_000;
+/** Shown before the first milestone arrives, or when the server does not stream. */
+const WAITING_MESSAGE = 'Hệ thống đang xử lý câu hỏi…';
+const ELAPSED_VISIBLE_AFTER_S = 5;
+const CANCEL_HINT_AFTER_S = 20;
+/** Screen readers hear the stage changes plus one update per interval, never every second. */
+const ANNOUNCE_INTERVAL_S = 15;
 
-export function ProgressStatus({ progress }: { progress: ChatProgress }) {
-  const [messageIndex, setMessageIndex] = useState(0);
+export function ProgressStatus({
+  progress,
+  stage = null,
+}: {
+  progress: ChatProgress;
+  stage?: ChatStage | null;
+}) {
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
 
   useEffect(() => {
-    if (progress === 'idle') {
-      // A new request must always start from the first visible message.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setMessageIndex(0);
-      return;
-    }
-
-    // A new processing period (including retry) gets a fresh message cycle.
-    setMessageIndex(0);
-    const timer = setInterval(() => {
-      setMessageIndex((current) => Math.min(current + 1, PROGRESS_MESSAGES.length - 1));
-    }, PROGRESS_INTERVAL_MS);
-
+    // Every processing period (including a retry) starts its own clock.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setElapsedSeconds(0);
+    if (progress === 'idle') return;
+    const timer = setInterval(() => setElapsedSeconds((seconds) => seconds + 1), 1_000);
     return () => clearInterval(timer);
   }, [progress]);
 
   if (progress === 'idle') return null;
+
+  const message = stage ? STAGE_MESSAGES[stage] : WAITING_MESSAGE;
+  const announcedSeconds =
+    Math.floor(elapsedSeconds / ANNOUNCE_INTERVAL_S) * ANNOUNCE_INTERVAL_S;
+  const announcement =
+    announcedSeconds > 0 ? `${message} Đã chờ ${announcedSeconds} giây.` : message;
+
   return (
     <div className="progress-status">
       <span className="progress-spinner" aria-hidden />
-      <span aria-hidden="true">{PROGRESS_MESSAGES[messageIndex]}</span>
+      <span className="progress-text" aria-hidden="true">
+        <span className="progress-line">
+          {message}
+          {elapsedSeconds >= ELAPSED_VISIBLE_AFTER_S && (
+            <span className="progress-elapsed"> · {elapsedSeconds} giây</span>
+          )}
+        </span>
+        <span className="progress-hint">
+          {elapsedSeconds >= CANCEL_HINT_AFTER_S ? 'Bạn có thể bấm Hủy để dừng yêu cầu.' : ''}
+        </span>
+      </span>
       <span className="sr-only" role="status" aria-live="polite">
-        Hệ thống đang xử lý câu hỏi
+        {announcement}
       </span>
     </div>
   );

@@ -472,14 +472,33 @@ button {
 
 .progress-status {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.5rem;
-  min-height: 1.5rem;
+  /* Reserves the hint line so the elapsed timer and hint never shift content. */
+  min-height: 2.75rem;
   color: var(--muted);
   font-size: 0.9rem;
 }
 
+.progress-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.progress-elapsed {
+  font-variant-numeric: tabular-nums;
+}
+
+.progress-hint {
+  min-height: 1.1rem;
+  font-size: 0.8rem;
+}
+
 .progress-spinner {
+  flex: none;
+  margin-top: 0.15rem;
   width: 16px;
   height: 16px;
   border: 2px solid var(--border);

@@ -10,6 +10,14 @@ const APPENDIX_ID = 'nd-188-2025:phu-luc-1:mau-6:noi-dung:2025-demo-v1';
 describe('MemoryLegalRepository', () => {
   repositoryContract(() => new MemoryLegalRepository(sampleCorpus));
 
+  it('filters the keyword fallback by the configured corpus version, like hybrid search', async () => {
+    const current = new MemoryLegalRepository(sampleCorpus, { corpusVersion: sampleCorpusVersion });
+    const other = new MemoryLegalRepository(sampleCorpus, { corpusVersion: 'another-version' });
+
+    expect((await current.keywordSearch('muc dong bao hiem y te', 10)).length).toBeGreaterThan(0);
+    expect(await other.keywordSearch('muc dong bao hiem y te', 10)).toEqual([]);
+  });
+
   describe('appendix exclusion', () => {
     const repo = () => new MemoryLegalRepository(sampleCorpus);
 

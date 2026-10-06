@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { ModelOutputTruncatedError } from '@/lib/ai/errors';
+
 import { loadGoldSet, runEvaluation } from './run-evaluation';
 import { buildEvaluationDeps } from './eval-support';
 
@@ -49,5 +51,36 @@ describe('gold-set evaluation', () => {
 
     expect(report.clarificationViolationCount).toBe(1);
     expect(report.cases[0].clarificationViolations).toEqual(['Bạn thuộc nhóm đối tượng nào?']);
+  });
+
+  it('counts a truncated answer as a failed case instead of crashing the run', async () => {
+    const report = await runEvaluation(
+      [
+        {
+          id: 'exact-truncated',
+          question: 'Khoản 3 Điều 12 Nghị định 158/2025/NĐ-CP quy định gì?',
+          expectedScope: 'grounded',
+          requiredSourceIds: [],
+          forbiddenClaims: [],
+          requiredClarifications: [],
+        },
+      ],
+      {
+        ...buildEvaluationDeps(),
+        generator: {
+          async generateStructured<T>(): Promise<T> {
+            throw new ModelOutputTruncatedError();
+          },
+        },
+      },
+    );
+
+    expect(report.truncatedCount).toBe(1);
+    expect(report.failedCount).toBe(1);
+    expect(report.cases[0]).toMatchObject({
+      actualScope: 'error',
+      finishReason: 'length',
+      failure: 'ModelOutputTruncatedError',
+    });
   });
 });

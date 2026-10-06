@@ -61,7 +61,7 @@ export function AppShell() {
             aria-expanded={drawerOpen}
             onClick={() => setDrawerOpen((open) => !open)}
           >
-            {drawerOpen ? <Menu size={20} aria-hidden /> : <Menu size={20} aria-hidden />}
+            {drawerOpen ? <X size={20} aria-hidden /> : <Menu size={20} aria-hidden />}
           </button>
           <AgencyBrand variant="header" />
         </header>
@@ -84,7 +84,7 @@ export function AppShell() {
               ) : null,
             )}
 
-            <ProgressStatus progress={session.progress} />
+            <ProgressStatus progress={session.progress} stage={session.stage} />
 
             {session.error && (
               <div className="error-banner" role="alert">

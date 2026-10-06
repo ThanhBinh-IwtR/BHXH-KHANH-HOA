@@ -8,7 +8,7 @@ import { createRagDeps } from '@/features/legal-rag/service-factory';
 export const runtime = 'nodejs';
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   context: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
   const { id } = await context.params;
@@ -16,10 +16,11 @@ export async function GET(
 
   try {
     const deps = createRagDeps();
-    const chunk = await deps.repository.getSource(id);
+    const options = { signal: request.signal };
+    const chunk = await deps.repository.getSource(id, options);
     if (!chunk) return apiError('not_found', 'Không tìm thấy nguồn trong bộ tài liệu hiện tại.');
 
-    const documents = await deps.repository.getDocuments();
+    const documents = await deps.repository.getDocuments(options);
     const document = documents.find((doc) => doc.documentId === chunk.documentId);
     if (!document) return apiError('not_found', 'Không tìm thấy tài liệu tương ứng.');
     const pdfUrl = getCorpusPdfUrl(document.documentId, chunk.pageFrom);

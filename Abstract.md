@@ -2,7 +2,7 @@
 
 > **Trạng thái dự án:** MVP/DEMO cho cuộc thi nội bộ
 >
-> **Cập nhật context:** 2026-09-19
+> **Cập nhật context:** 2026-09-19 (lượt triển khai P0-18 → P0-22, P1-05 → P1-10)
 >
 > **Vai trò tài liệu:** nguồn context chung về mục tiêu, phạm vi, kiến trúc, trạng thái và định hướng của dự án
 
@@ -166,14 +166,17 @@ Next.js UI: chat → answer card → citation chip → source viewer/PDF
 6. Tạo `context_header`, `body_text`, page range, deterministic ID và provenance.
 7. Phát hiện quan hệ parent/sibling/cross-reference trong giới hạn parser.
 8. Chạy validation/quality report; artifact không đạt gate không được dùng để thay corpus đang hoạt động.
-9. Tạo embedding và publish atomically vào Supabase khi triển khai corpus thật.
+9. Tạo embedding (lệnh `embed`, cache resume được) và publish atomically vào Supabase (lệnh `publish`:
+   chunk nạp ở `staged`, RPC `activate_legal_corpus` bật corpus mới và hạ corpus cũ trong một transaction).
 
 OCR và ingestion là quy trình offline. Hiệu năng của chúng ít ảnh hưởng đến độ trễ chat trong bản demo,
 vì vậy tối ưu song song/cache quy mô lớn được để ngoài scope hiện tại.
 
 ## 9. Luồng xử lý một câu hỏi
 
-1. API kiểm tra request body, history và rate limit.
+1. API kiểm tra request body, history và rate limit; deadline tổng `REQUEST_TIMEOUT_MS` được chia cho từng
+   stage (embedding ≤ 15%, rerank ≤ 15% và chỉ chạy khi còn ≥ 50%, generation nhận phần còn lại). Signal hủy
+   đi tới provider **và** repository.
 2. Query parser chuẩn hóa câu hỏi, nhận diện số hiệu/Điều/Khoản/Điểm và tạo câu hỏi độc lập nếu cần.
 3. Exact path lấy trực tiếp tham chiếu rõ ràng.
 4. Hybrid retrieval kết hợp full-text, tìm kiếm không dấu, trigram và vector.
@@ -184,7 +187,7 @@ vì vậy tối ưu song song/cache quy mô lớn được để ngoài scope hi
 9. Validator deterministic loại claim có source ID giả, citation thiếu hoặc số liệu không có trong
    chunk được dẫn; khi thiếu căn cứ hệ thống hạ mức độ hoặc dùng safe fallback.
 10. Backend chỉ trả output cuối sau bước kiểm tra căn cứ; UI hiển thị câu trả lời, citation/trang
-   PDF và cảnh báo người dùng đối chiếu nguồn gốc.
+   PDF và cảnh báo người dùng đối chiếu nguồn gốc. Trong lúc chờ, UI nhận mốc stage thật qua SSE.
 
 Các fallback dự kiến:
 
@@ -192,6 +195,9 @@ Các fallback dự kiến:
 - Embedding query lỗi: dùng exact/keyword nếu bằng chứng đủ mạnh.
 - Không có nguồn đủ mạnh: yêu cầu làm rõ hoặc trả ngoài phạm vi.
 - Output sai schema: parse/validate cục bộ một lần; nếu vẫn không hợp lệ thì fail an toàn.
+- Output bị cắt vì hết token (`finish_reason: length`): lỗi `output_truncated` có thể thử lại, không bao giờ
+  hiển thị thành "ngoài phạm vi".
+- Embedding/rerank chậm: hết ngân sách stage thì dùng keyword/thứ tự RRF, generation vẫn được gọi.
 - Provider timeout: kết thúc request với lỗi có thể thử lại, không retry vô hạn.
 
 ## 10. Mô hình câu trả lời
@@ -207,13 +213,12 @@ Output chính gồm:
 
 - `short_answer`: kết luận ngắn để đọc trước.
 - `analysis`: danh sách claim và source ID tương ứng.
-- `ai_supplement`: giải thích bổ sung, luôn tách khỏi nội dung đã được corpus hỗ trợ.
 - `missing_information`: dữ kiện còn thiếu.
 - `follow_up_question`: câu hỏi làm rõ khi cần.
 - `sources`: dữ liệu phục vụ citation và source viewer.
 
-AI supplement không được dùng để khẳng định mức hưởng, điều kiện, thời hạn hoặc kết quả pháp lý khi
-corpus không hỗ trợ.
+Trường `ai_supplement` đã bị bỏ khỏi prompt, schema và API (2026-09-19) vì không bao giờ được hiển thị.
+Nếu verifier loại bất kỳ claim nào của model, trạng thái `grounded` bị hạ xuống `partial`.
 
 ## 11. Dữ liệu và repository
 
@@ -221,6 +226,8 @@ Repository contract giúp business logic chạy với hai backend:
 
 - **Memory:** nhanh, deterministic, không cần credential; phù hợp unit test và fallback giới hạn.
 - **Supabase:** backend dùng cho bản demo đầy đủ, hỗ trợ metadata, hybrid search và vector search.
+  Ứng dụng đọc chunk qua view `legal_chunk_rows` (có số hiệu văn bản, không có cột embedding). Mọi method
+  nhận `AbortSignal`, và mỗi lời gọi có trần 10 giây.
 
 Các bảng chính theo migration:
 
@@ -238,15 +245,19 @@ chỉ được giữ trong `sessionStorage` của tab hiện tại.
 ### 12.1. API
 
 - `POST /api/chat`: nhận câu hỏi và history giới hạn; trả structured answer sau deterministic validation.
-- `GET /api/documents`: trả danh sách tài liệu thuộc corpus.
+  Với `Accept: text/event-stream`, route phát sự kiện `stage` theo tiến trình thật rồi đúng một `result` hoặc
+  `error`.
+- `GET /api/documents`: trả danh sách tài liệu `active` của corpus; sidebar dùng API này.
 - `GET /api/sources/:id`: trả chunk nguồn, breadcrumb, page range và URL PDF.
+- `GET /corpus/:filename`: stream PDF trong allowlist, hỗ trợ `Range`/`206` và `HEAD`.
 
 ### 12.2. UI
 
 - Desktop dùng sidebar, vùng hội thoại và source drawer.
 - Mobile chuyển về một cột, menu trượt và source bottom sheet.
 - Answer card ưu tiên kết luận ngắn, sau đó phân tích và citation inline.
-- Trạng thái loading/error phải có chữ, focus rõ và không phụ thuộc riêng vào màu hoặc spinner.
+- Trạng thái loading/error phải có chữ, focus rõ và không phụ thuộc riêng vào màu hoặc spinner. Trạng thái chờ
+  hiển thị mốc thật và đồng hồ chờ; ô nhập không bị disable nên không mất focus.
 - Citation không hiển thị similarity score; người dùng quan tâm căn cứ, không phải chi tiết ranking nội bộ.
 
 ## 13. Provider và cấu hình
@@ -261,6 +272,9 @@ Ba vai trò provider được tách biệt:
 
 Model slug và endpoint là cấu hình triển khai, không phải business rule. Việc đổi model phải được đánh
 giá lại trên cùng gold set tiếng Việt trước khi dùng trong demo.
+
+`AI_TIMEOUT_MS` là trần cho một lời gọi provider và phải ≤ 60% `REQUEST_TIMEOUT_MS`; `env.ts` chặn ngay khi
+khởi động. Demo dùng 36000/60000 và `LLM_MAX_OUTPUT_TOKENS=2048`.
 
 `LEGAL_REPOSITORY=memory` dành cho phát triển/test; `LEGAL_REPOSITORY=supabase` là hướng chính cho demo
 đầy đủ. Secret chỉ tồn tại server-side và không được đưa vào client bundle hoặc commit vào repository.
@@ -373,6 +387,30 @@ ngắn; retrieval lọc chunk khác chủ đề trước khi đưa vào generato
 deadline. Các gate credential, Supabase, p95 live 5+5 và rehearsal vẫn mở theo `TODO-MVP-DEMO.md`; live
 citation smoke có mẫu thành công mới nhất sau restart trong 19,976 ms (≈19,98 giây) với một LLM call, short answer 2 câu,
 5 mục analysis và một source cho câu hỏi BHYT; một lần thử khác vẫn 504 ở 50,981 ms (≈50,98 giây), nên chưa kết luận p95.
+
+### Cập nhật kiểm chứng ngày 2026-09-19
+
+Lượt triển khai sau rà soát toàn luồng đã xử lý phần code của P0-18 → P0-22 và P1-05 → P1-10:
+
+- **Publish corpus (P0-18):** thêm các lệnh `link-references`, `embed` (resume được) và `publish` (staged →
+  activate trong một transaction, publish lại thì idempotent, lỗi giữa chừng không ảnh hưởng corpus đang
+  phục vụ) cùng migration `202609190001`. Rà soát phát hiện đường Supabase **không thể chạy** trước đây: đọc
+  chunk thiếu `document_number` nên lỗi parse, và keyword AND trả 0 kết quả cho câu hỏi tự nhiên. Cả hai đã
+  được sửa. Toàn bộ đã chạy trên PostgreSQL 16 + pgvector cục bộ với artifact thật 649 chunk. Việc publish
+  lên Supabase thật vẫn **chờ credential** Supabase và token HF.
+- **Ngân sách thời gian (P0-19), hủy tới repository (P0-20):** repro "embed 300 ms + rerank 300 ms, budget
+  500 ms" trước đây fail trắng, nay trả câu trả lời trong < 500 ms. Hủy request làm dừng cả lời gọi HTTP
+  tới provider và PostgREST.
+- **PDF (P0-21):** route stream có Range. Đỉnh bộ nhớ khi phục vụ file 49 MB giảm từ +632 MB xuống +73 MB.
+  Tuy vậy, trình xem PDF của Chromium chỉ tải theo trang với file đã linearize, còn các nghị định là file
+  ký số không linearize. Mở NĐ 188 trên localhost vẫn mất ≈ 2–3 giây; tiêu chí "không chờ tải toàn bộ file"
+  cần quyết định giữa chấp nhận mức này hoặc nhúng PDF.js.
+- **Truncation (P0-22), verifier (P1-07):** hết token trả `output_truncated` thay vì "ngoài phạm vi";
+  `ai_supplement` bị bỏ; claim bị loại hạ trạng thái xuống `partial`.
+- **Trải nghiệm chờ (P1-06, P1-10):** mốc stage thật qua SSE, đồng hồ chờ, screen reader nhận thông báo thưa,
+  ô nhập giữ focus. Đã kiểm tra trên trình duyệt thật ở 1440/360 px.
+
+Các gate còn mở là live gate (Supabase, HF token, p95 trên mạng demo, rehearsal), không phải code.
 
 Danh sách chi tiết, mức ưu tiên và tiêu chí hoàn thành nằm trong `TODO-MVP-DEMO.md`.
 

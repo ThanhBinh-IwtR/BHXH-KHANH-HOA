@@ -17,7 +17,6 @@ const groundedAnswer: PublicResponse = {
       citations: [{ sourceId: 'nd-158:d12:k3', label: '158/2025/NĐ-CP · Điều 12 · Khoản 3' }],
     },
   ],
-  aiSupplement: 'Giải thích thêm về quỹ hưu trí.',
   missingInformation: [],
   followUpQuestion: null,
   sources: [
@@ -154,7 +153,12 @@ describe('AnswerCard', () => {
   });
 
   it('does not render the unverified supplement or a repeated source list', () => {
-    render(<AnswerCard answer={groundedAnswer} onOpenSource={() => {}} />);
+    // A payload from an older server may still carry the removed field.
+    const legacyAnswer = {
+      ...groundedAnswer,
+      aiSupplement: 'Giải thích thêm về quỹ hưu trí.',
+    } as PublicResponse;
+    render(<AnswerCard answer={legacyAnswer} onOpenSource={() => {}} />);
     expect(screen.queryByText(/nguồn đã dùng/i)).toBeNull();
     expect(screen.queryByText(/ai bổ sung/i)).toBeNull();
     expect(screen.queryByText('Giải thích thêm về quỹ hưu trí.')).toBeNull();

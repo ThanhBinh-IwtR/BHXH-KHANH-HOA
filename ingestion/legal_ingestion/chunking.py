@@ -100,6 +100,9 @@ class LegalChunkRecord(_FrozenModel):
     parent_id: str | None
     previous_sibling_id: str | None
     next_sibling_id: str | None
+    # Resolved same-document targets of explicit "Điều/khoản/điểm" references,
+    # in first-mention order. Filled by attach_cross_reference_ids().
+    cross_reference_ids: tuple[str, ...] = ()
     token_count: int = Field(ge=1)
     embedding: tuple[float, ...] | None
     corpus_version: str

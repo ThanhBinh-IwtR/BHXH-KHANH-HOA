@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { RagServiceDeps } from '@/features/legal-rag/service';
-import { ProviderUnavailableError } from '@/lib/ai/errors';
+import { ModelOutputTruncatedError, ProviderUnavailableError } from '@/lib/ai/errors';
 import type { LlmClient } from '@/lib/ai/contracts';
 import { MemoryLegalRepository } from '@/lib/db/memory-legal-repository';
 import { sampleCorpus, sampleCorpusVersion } from '@/lib/db/sample-corpus';
@@ -25,7 +25,6 @@ function baseDeps(overrides: Partial<RagServiceDeps> = {}): RagServiceDeps {
         scope_status: 'grounded',
         short_answer: 'Người sử dụng lao động đóng 17%.',
         analysis: [{ claim: 'Tỷ lệ đóng là 17%.', source_ids: [GROUNDED_ID] }],
-        ai_supplement: null,
         missing_information: [],
         follow_up_question: null,
       },
@@ -44,6 +43,12 @@ class RateLimitedLlm implements LlmClient {
   }
 }
 
+class TruncatingLlm implements LlmClient {
+  async generateStructured<T>(): Promise<T> {
+    throw new ModelOutputTruncatedError();
+  }
+}
+
 class TimedOutLlm implements LlmClient {
   async generateStructured<T>(): Promise<T> {
     throw new ProviderUnavailableError('AI provider request timed out');
@@ -59,6 +64,18 @@ function post(body: unknown, ip = '10.0.0.1') {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     }) as any,
   );
+}
+
+function parseEvents(text: string): { event: string; data: Record<string, unknown> }[] {
+  return text
+    .split('\n\n')
+    .filter((block) => block.trim())
+    .map((block) => {
+      const lines = block.split('\n');
+      const event = lines.find((line) => line.startsWith('event: '))?.slice('event: '.length) ?? '';
+      const data = lines.find((line) => line.startsWith('data: '))?.slice('data: '.length) ?? '{}';
+      return { event, data: JSON.parse(data) as Record<string, unknown> };
+    });
 }
 
 describe('POST /api/chat', () => {
@@ -179,6 +196,26 @@ describe('POST /api/chat', () => {
     expect(JSON.stringify(details)).not.toMatch(/khoản 3|apiKey|sourceText|shortAnswer/i);
   });
 
+  it('reports a truncated model answer as too long, never as out of scope', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    state.deps = baseDeps({ generator: new TruncatingLlm() });
+
+    const response = await post(
+      { message: 'khoản 3 Điều 12 Nghị định 158/2025/NĐ-CP quy định gì?' },
+      '10.0.0.62',
+    );
+
+    expect(response.status).toBe(502);
+    const json = await response.json();
+    expect(json).toMatchObject({
+      error: { code: 'output_truncated', message: expect.stringMatching(/quá độ dài|bị cắt/i) },
+    });
+    expect(JSON.stringify(json)).not.toMatch(/ngoài phạm vi|out_of_scope/i);
+    const call = warning.mock.calls.find(([label]) => label === '[api/chat] provider unavailable:');
+    const details = JSON.parse(String(call?.[1]));
+    expect(details).toMatchObject({ name: 'ModelOutputTruncatedError', reason: 'output_truncated' });
+  });
+
   it('returns a retryable provider-rate-limit response for an upstream 429', async () => {
     state.deps = baseDeps({ generator: new RateLimitedLlm() });
     const response = await post(
@@ -192,6 +229,61 @@ describe('POST /api/chat', () => {
         message: expect.stringMatching(/thử lại/i),
       },
     });
+  });
+
+  it('streams real stage milestones and then the verified answer over SSE', async () => {
+    const response = await POST(
+      new Request('http://localhost/api/chat', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'text/event-stream, application/json',
+          'x-forwarded-for': '10.0.0.70',
+        },
+        body: JSON.stringify({ message: 'khoản 3 Điều 12 Nghị định 158/2025/NĐ-CP quy định gì?' }),
+      }) as never,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toMatch(/text\/event-stream/);
+    const events = parseEvents(await response.text());
+    expect(events.filter((event) => event.event === 'stage').map((event) => event.data.stage)).toEqual([
+      'retrieval',
+      'context',
+      'generation',
+      'verification',
+    ]);
+    const result = events.at(-1);
+    expect(result?.event).toBe('result');
+    expect(result?.data).toMatchObject({ scopeStatus: 'grounded' });
+    expect(JSON.stringify(events)).not.toContain('fusedScore');
+  });
+
+  it('ends the stream with a classified error event when the provider fails', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    state.deps = baseDeps({ generator: new UnavailableLlm() });
+    const response = await POST(
+      new Request('http://localhost/api/chat', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'text/event-stream',
+          'x-forwarded-for': '10.0.0.71',
+        },
+        body: JSON.stringify({ message: 'khoản 3 Điều 12 Nghị định 158/2025/NĐ-CP quy định gì?' }),
+      }) as never,
+    );
+
+    const events = parseEvents(await response.text());
+    expect(events.at(-1)).toEqual({
+      event: 'error',
+      data: {
+        code: 'provider_unavailable',
+        message: expect.stringMatching(/thử lại/i),
+        status: 503,
+      },
+    });
+    expect(JSON.stringify(events)).not.toMatch(/llm down|stack|apiKey/i);
   });
 
   it('returns 429 after exceeding the rate limit for one client', async () => {

@@ -7,6 +7,7 @@ export type ApiErrorCode =
   | 'provider_rate_limited'
   | 'provider_timeout'
   | 'provider_unavailable'
+  | 'output_truncated'
   | 'internal_error';
 
 const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
@@ -16,8 +17,13 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   provider_rate_limited: 429,
   provider_timeout: 504,
   provider_unavailable: 503,
+  output_truncated: 502,
   internal_error: 500,
 };
+
+export function apiErrorStatus(code: ApiErrorCode): number {
+  return STATUS_BY_CODE[code];
+}
 
 /**
  * Build a safe JSON error. Only a stable code and a generic message ever reach

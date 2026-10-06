@@ -2,7 +2,13 @@
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { getRetryAfterMs, ProviderUnavailableError } from '@/lib/ai/errors';
+import { stageTimeoutMs } from '@/lib/ai/contracts';
+import {
+  getRetryAfterMs,
+  InvalidModelOutputError,
+  ModelOutputTruncatedError,
+  ProviderUnavailableError,
+} from '@/lib/ai/errors';
 import { HuggingFaceEmbeddingClient } from '@/lib/ai/huggingface-embedding';
 import { HuggingFaceRerankerClient } from '@/lib/ai/huggingface-reranker';
 import { OpenAiCompatibleLlm } from '@/lib/ai/openai-compatible-llm';
@@ -87,6 +93,76 @@ describe('withTimeout', () => {
       ProviderUnavailableError,
     );
     expect(operation).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('stage budgets', () => {
+  it('uses the smaller of the adapter timeout and the call budget', () => {
+    expect(stageTimeoutMs(36_000)).toBe(36_000);
+    expect(stageTimeoutMs(36_000, { timeoutMs: 9_000 })).toBe(9_000);
+    expect(stageTimeoutMs(5_000, { timeoutMs: 9_000 })).toBe(5_000);
+    expect(stageTimeoutMs(5_000, { timeoutMs: 0 })).toBe(1);
+  });
+
+  it('caps a hung first attempt so the permitted retry still fits the stage budget', async () => {
+    let attempts = 0;
+    const started = Date.now();
+    const result = await withTimeout(
+      (signal) => {
+        attempts += 1;
+        if (attempts === 1) {
+          return new Promise<string>((_resolve, reject) =>
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+          );
+        }
+        return Promise.resolve('second attempt');
+      },
+      { timeoutMs: 1_000, attemptTimeoutMs: 100 },
+    );
+
+    expect(result).toBe('second attempt');
+    expect(attempts).toBe(2);
+    expect(Date.now() - started).toBeLessThan(600);
+  });
+
+  it('lets the only attempt use the whole budget when no attempt cap is set', async () => {
+    const started = Date.now();
+    await expect(
+      withTimeout(
+        (signal) =>
+          new Promise((_resolve, reject) =>
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+          ),
+        { timeoutMs: 150, retry: false },
+      ),
+    ).rejects.toThrow(/timed out/);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(140);
+  });
+
+  it('stops an embedding call at the per-call stage budget, not the adapter timeout', async () => {
+    const fetchImpl = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) =>
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true }),
+        ),
+    );
+    const client = new HuggingFaceEmbeddingClient({
+      baseUrl: 'https://router.huggingface.co',
+      apiKey: 'test',
+      model: 'BAAI/bge-m3',
+      timeoutMs: 30_000,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const started = Date.now();
+
+    await expect(client.embed(['câu hỏi'], { timeoutMs: 600 })).rejects.toBeInstanceOf(
+      ProviderUnavailableError,
+    );
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(550);
+    expect(elapsed).toBeLessThan(1_200);
+    // A hung first attempt is cut at half the stage budget, leaving room for one retry.
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -224,5 +300,69 @@ describe('OpenAiCompatibleLlm', () => {
       max_tokens: 512,
       thinking: { type: 'disabled' },
     });
+  });
+});
+
+describe('OpenAiCompatibleLlm finish_reason handling', () => {
+  function completion(content: string, finishReason: string, completionTokens = 10) {
+    return jsonResponse({
+      id: 'chatcmpl-test',
+      object: 'chat.completion',
+      created: 0,
+      model: 'glm-4.5-flash',
+      choices: [
+        { index: 0, finish_reason: finishReason, message: { role: 'assistant', content, refusal: null } },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: completionTokens, total_tokens: completionTokens + 1 },
+    });
+  }
+
+  function client() {
+    return new OpenAiCompatibleLlm({
+      baseUrl: 'https://api.z.ai/api/paas/v4',
+      apiKey: 'test-key',
+      model: 'glm-4.5-flash',
+      timeoutMs: 1000,
+      maxOutputTokens: 2048,
+    });
+  }
+
+  it('reports a cut-off JSON payload as truncation, not as a schema error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      completion('{"scope_status":"grounded","short_answer":"Mức đóng', 'length', 2048),
+    );
+    const onUsage = vi.fn();
+
+    const failure = client().generateStructured(
+      { system: 'Return JSON.', user: 'Test', schemaName: 'legal_answer' },
+      { onUsage },
+    );
+
+    await expect(failure).rejects.toBeInstanceOf(ModelOutputTruncatedError);
+    await expect(failure).rejects.toBeInstanceOf(InvalidModelOutputError);
+    expect(onUsage).toHaveBeenCalledWith({ finishReason: 'length', completionTokens: 2048 });
+    vi.restoreAllMocks();
+  });
+
+  it('accepts a complete JSON object even when the provider reports the length limit', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(completion('{"ok":true}', 'length'));
+
+    await expect(
+      client().generateStructured({ system: 'Return JSON.', user: 'Test', schemaName: 'test' }),
+    ).resolves.toEqual({ ok: true });
+    vi.restoreAllMocks();
+  });
+
+  it('keeps a genuinely malformed but complete answer classified as a schema error', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(completion('không phải JSON', 'stop'));
+
+    const failure = client().generateStructured({
+      system: 'Return JSON.',
+      user: 'Test',
+      schemaName: 'test',
+    });
+    await expect(failure).rejects.toBeInstanceOf(InvalidModelOutputError);
+    await expect(failure).rejects.not.toBeInstanceOf(ModelOutputTruncatedError);
+    vi.restoreAllMocks();
   });
 });

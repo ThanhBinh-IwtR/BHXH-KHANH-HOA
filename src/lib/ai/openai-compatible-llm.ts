@@ -1,7 +1,11 @@
 import OpenAI from 'openai';
 
-import type { LlmClient, ProviderCallOptions } from './contracts';
-import { InvalidModelOutputError, ProviderUnavailableError } from './errors';
+import { stageTimeoutMs, type LlmCallOptions, type LlmClient } from './contracts';
+import {
+  InvalidModelOutputError,
+  ModelOutputTruncatedError,
+  ProviderUnavailableError,
+} from './errors';
 import { withTimeout } from './with-timeout';
 
 export interface OpenAiCompatibleOptions {
@@ -43,8 +47,10 @@ export class OpenAiCompatibleLlm implements LlmClient {
     system: string;
     user: string;
     schemaName: string;
-  }, options: ProviderCallOptions = {}): Promise<T> {
-    const content = await withTimeout(async (signal) => {
+  }, options: LlmCallOptions = {}): Promise<T> {
+    // No per-attempt cap: a slow generation is not helped by cutting it short
+    // and retrying. The retry is only useful after a fast transient failure.
+    const completion = await withTimeout(async (signal) => {
       const request = {
         model: this.model,
         temperature: this.temperature,
@@ -59,9 +65,31 @@ export class OpenAiCompatibleLlm implements LlmClient {
           : { thinking: { type: this.thinkingMode } }),
       };
       const response = await this.client.chat.completions.create(request, { signal });
-      return response.choices[0]?.message?.content ?? '';
-    }, { timeoutMs: this.timeoutMs, signal: options.signal });
+      const choice = response.choices[0];
+      return {
+        content: choice?.message?.content ?? '',
+        finishReason: choice?.finish_reason ?? null,
+        completionTokens: response.usage?.completion_tokens ?? null,
+      };
+    }, { timeoutMs: stageTimeoutMs(this.timeoutMs, options), signal: options.signal });
 
+    options.onUsage?.({
+      finishReason: completion.finishReason,
+      completionTokens: completion.completionTokens,
+    });
+
+    const { content } = completion;
+    if (completion.finishReason === 'length') {
+      // Only a complete JSON object is usable; a cut-off payload is reported as
+      // truncation rather than as a schema error or an empty response.
+      try {
+        return JSON.parse(extractJson(content)) as T;
+      } catch {
+        throw new ModelOutputTruncatedError(
+          `Model output for ${input.schemaName} reached the output-token limit`,
+        );
+      }
+    }
     if (!content.trim()) {
       throw new ProviderUnavailableError('Model returned an empty response');
     }

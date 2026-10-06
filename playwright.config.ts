@@ -17,6 +17,7 @@ const DETERMINISTIC_WEB_SERVER_ENV: Record<string, string> = {
   RERANKER_API_KEY: 'test',
   RERANKER_MODEL: 'test-rerank',
   AI_TIMEOUT_MS: '30000',
+  REQUEST_TIMEOUT_MS: '60000',
   RATE_LIMIT_SALT: 'e2e-salt',
 };
 

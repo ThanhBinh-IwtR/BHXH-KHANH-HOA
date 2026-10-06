@@ -12,6 +12,11 @@ export interface ChatMessage {
 
 export type ChatProgress = 'idle' | 'processing';
 
+/** Real pipeline milestones streamed by POST /api/chat (text/event-stream). */
+export type ChatStage = 'retrieval' | 'context' | 'generation' | 'verification';
+
+export const CHAT_STAGES: readonly ChatStage[] = ['retrieval', 'context', 'generation', 'verification'];
+
 export const SESSION_STORAGE_KEY = 'legal-chat-session';
 export const MAX_STORED_MESSAGES = 30;
 export const MAX_HISTORY_TURNS = 6;

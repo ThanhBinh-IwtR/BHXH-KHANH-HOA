@@ -1,6 +1,6 @@
 import type { EmbeddingClient, ProviderCallOptions } from './contracts';
 import { getProviderStatus, ProviderUnavailableError } from './errors';
-import { huggingFaceModelEndpoint } from './huggingface-endpoint';
+import { huggingFaceModelEndpoint, huggingFaceStageOptions } from './huggingface-endpoint';
 import { parseRetryAfterMs, withTimeout } from './with-timeout';
 
 export interface HuggingFaceEmbeddingOptions {
@@ -59,7 +59,7 @@ export class HuggingFaceEmbeddingClient implements EmbeddingClient {
           throw new ProviderUnavailableError('Embedding response shape was invalid');
         }
         return vectors;
-      }, { timeoutMs: this.options.timeoutMs, signal: callOptions.signal });
+      }, huggingFaceStageOptions(this.options.timeoutMs, callOptions));
     } catch (error) {
       const status = getProviderStatus(error);
       if (status === 401 || status === 403) this.disabledStatus = status;

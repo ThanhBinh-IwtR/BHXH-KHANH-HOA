@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 
 import { loadEnvConfig } from '@next/env';
 
+import { ModelOutputTruncatedError } from '@/lib/ai/errors';
+
 import { retrieveEvidence } from '@/features/legal-rag/retrieval';
 import { resolveStandaloneQuestion, runRag, type RagServiceDeps } from '@/features/legal-rag/service';
 import type { PublicResponse } from '@/features/legal-rag/public-response';
@@ -37,6 +39,11 @@ export interface CaseResult {
   clarificationViolations: string[];
   incompleteScopeViolations: string[];
   latencyMs: number;
+  /** Provider stop reason of the generation call (null when no model was called). */
+  finishReason: string | null;
+  completionTokens: number | null;
+  /** Error class when the pipeline failed instead of answering, e.g. ModelOutputTruncatedError. */
+  failure: string | null;
 }
 
 export interface EvaluationReport {
@@ -49,6 +56,10 @@ export interface EvaluationReport {
   forbiddenViolationCount: number;
   clarificationViolationCount: number;
   incompleteScopeResponseCount: number;
+  /** Cases whose answer was cut off by LLM_MAX_OUTPUT_TOKENS. Must be 0. */
+  truncatedCount: number;
+  failedCount: number;
+  maxCompletionTokens: number | null;
   cases: CaseResult[];
 }
 
@@ -80,7 +91,32 @@ export async function runEvaluation(
       item.requiredSourceIds.length === 0 || ranks.every((rank) => rank >= 0);
     const bestRank = ranks.filter((rank) => rank >= 0).sort((a, b) => a - b)[0];
 
-    const { response } = await runRag({ message: item.question, history }, deps);
+    let outcome;
+    try {
+      outcome = await runRag({ message: item.question, history }, deps);
+    } catch (error) {
+      // A classified pipeline failure (e.g. truncation) is a failed case, not a crash.
+      cases.push({
+        id: item.id,
+        expectedScope: item.expectedScope,
+        actualScope: 'error',
+        scopeMatch: false,
+        isExactLookup: item.id.startsWith('exact-'),
+        recallHit,
+        retrievalRank: bestRank === undefined ? null : bestRank + 1,
+        unknownCitationIds: [],
+        uncitedClaims: 0,
+        forbiddenViolations: [],
+        clarificationViolations: [],
+        incompleteScopeViolations: [],
+        latencyMs: Date.now() - started,
+        finishReason: error instanceof ModelOutputTruncatedError ? 'length' : null,
+        completionTokens: null,
+        failure: error instanceof Error ? error.name : 'UnknownError',
+      });
+      continue;
+    }
+    const { response, metrics } = outcome;
 
     const shortAnswerCitations = response.shortAnswerCitations ?? [];
     const citationIds = [
@@ -101,7 +137,6 @@ export async function runEvaluation(
 
     const haystack = [
       response.shortAnswer,
-      response.aiSupplement ?? '',
       ...response.missingInformation,
       response.followUpQuestion ?? '',
       ...response.analysis.map((claim) => claim.claim),
@@ -130,6 +165,9 @@ export async function runEvaluation(
       clarificationViolations,
       incompleteScopeViolations,
       latencyMs: Date.now() - started,
+      finishReason: metrics.finishReason ?? null,
+      completionTokens: metrics.completionTokens ?? null,
+      failure: null,
     });
   }
 
@@ -154,6 +192,13 @@ export async function runEvaluation(
     incompleteScopeResponseCount: cases.reduce(
       (sum, entry) => sum + entry.incompleteScopeViolations.length,
       0,
+    ),
+    truncatedCount: cases.filter((entry) => entry.finishReason === 'length').length,
+    failedCount: cases.filter((entry) => entry.failure !== null).length,
+    maxCompletionTokens: cases.reduce<number | null>(
+      (max, entry) =>
+        entry.completionTokens === null ? max : Math.max(max ?? 0, entry.completionTokens),
+      null,
     ),
     cases,
   };
@@ -201,14 +246,19 @@ export function toMarkdown(report: EvaluationReport): string {
     `- Forbidden claim violations: ${report.forbiddenViolationCount}`,
     `- Missing required clarifications: ${report.clarificationViolationCount}`,
     `- Incomplete non-grounded responses: ${report.incompleteScopeResponseCount}`,
+    `- Truncated answers (finish_reason=length): ${report.truncatedCount}`,
+    `- Pipeline failures: ${report.failedCount}`,
+    `- Max completion tokens: ${report.maxCompletionTokens ?? '-'}`,
     '',
-    '| Case | Expected | Actual | Recall | Rank | Latency |',
-    '| --- | --- | --- | --- | --- | --- |',
+    '| Case | Expected | Actual | Recall | Rank | Latency | Stop | Tokens |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |',
     ...report.cases.map(
       (entry) =>
         `| ${entry.id} | ${entry.expectedScope} | ${entry.actualScope} | ${
           entry.recallHit ? '✓' : '✗'
-        } | ${entry.retrievalRank ?? '-'} | ${entry.latencyMs}ms |`,
+        } | ${entry.retrievalRank ?? '-'} | ${entry.latencyMs}ms | ${entry.finishReason ?? '-'} | ${
+          entry.completionTokens ?? '-'
+        } |`,
     ),
   ];
   return lines.join('\n');
@@ -231,7 +281,8 @@ async function main(): Promise<void> {
     report.uncitedClaimCount > 0 ||
     report.forbiddenViolationCount > 0 ||
     report.clarificationViolationCount > 0 ||
-    report.incompleteScopeResponseCount > 0;
+    report.incompleteScopeResponseCount > 0 ||
+    report.truncatedCount > 0;
   process.exit(failed ? 1 : 0);
 }
 

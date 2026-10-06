@@ -1,10 +1,15 @@
 import { ProviderUnavailableError } from '@/lib/ai/errors';
-import type { EmbeddingClient, ProviderCallOptions, RerankerClient } from '@/lib/ai/contracts';
+import type { EmbeddingClient, RerankerClient } from '@/lib/ai/contracts';
 import { RepositoryUnavailableError, type LegalRepository } from '@/lib/db/legal-repository';
 import { removeAccents } from '@/lib/db/text';
 
 import { parseLegalReference, type LegalReference } from './query-parser';
 import { reciprocalRankFusion } from './rank-fusion';
+import {
+  runWithinStageBudget,
+  StageBudgetExceededError,
+  type RequestBudget,
+} from './request-budget';
 import type { RetrievedChunk } from './types';
 
 export interface RetrievalRequest {
@@ -21,6 +26,16 @@ export interface EvidenceSet {
   degradedReasons?: readonly string[];
   evidenceStrength: 'exact' | 'keyword' | 'weak';
   hasAcceptableEvidence: boolean;
+}
+
+export interface RetrievalOptions {
+  /** Request cancellation/deadline, forwarded to providers and the repository. */
+  signal?: AbortSignal;
+  /**
+   * Request budget. When present, embedding and reranking each run under their
+   * own stage budget and are skipped when they would starve generation.
+   */
+  budget?: Pick<RequestBudget, 'auxiliaryStageMs'>;
 }
 
 const CANDIDATE_COUNT = 30;
@@ -43,11 +58,12 @@ export async function retrieveEvidence(
   repository: LegalRepository,
   embedder: EmbeddingClient,
   reranker: RerankerClient,
-  options: ProviderCallOptions = {},
+  options: RetrievalOptions = {},
 ): Promise<EvidenceSet> {
   const query = request.query.normalize('NFC');
   const reference = parseLegalReference(query);
-  const exact = reference ? await repository.exactSearch(reference) : [];
+  const repositoryOptions = { signal: options.signal };
+  const exact = reference ? await repository.exactSearch(reference, repositoryOptions) : [];
 
   // An explicit legal coordinate is already a deterministic retrieval result.
   // Avoid spending provider latency (and a second failure surface) on a
@@ -73,23 +89,34 @@ export async function retrieveEvidence(
 
   let hybrid: readonly RetrievedChunk[] = [];
   let usedKeywordFallback = false;
+  const degradedReasons: string[] = [];
   try {
-    const [queryVector] = await embedder.embed([query], options);
-    hybrid = await repository.hybridSearch({
-      queryText: query,
-      queryUnaccented: removeAccents(query),
-      queryVector: queryVector ?? null,
-      matchCount: CANDIDATE_COUNT,
-      corpusVersion: request.corpusVersion,
-    });
+    const queryVector = await embedQuery(query, embedder, options);
+    hybrid = await repository.hybridSearch(
+      {
+        queryText: query,
+        queryUnaccented: removeAccents(query),
+        queryVector,
+        matchCount: CANDIDATE_COUNT,
+        corpusVersion: request.corpusVersion,
+      },
+      repositoryOptions,
+    );
   } catch (error) {
     if (options.signal?.aborted) throw error;
     if (!(error instanceof ProviderUnavailableError) && !(error instanceof RepositoryUnavailableError)) {
       throw error;
     }
     if (exact.length === 0) {
-      hybrid = await repository.keywordSearch(query, CANDIDATE_COUNT);
+      hybrid = await repository.keywordSearch(query, CANDIDATE_COUNT, repositoryOptions);
       usedKeywordFallback = true;
+      degradedReasons.push(
+        error instanceof EmbeddingSkippedError
+          ? 'embedding_skipped_budget'
+          : error instanceof StageBudgetExceededError
+            ? 'embedding_timeout_keyword_fallback'
+            : 'embedding_unavailable_keyword_fallback',
+      );
     }
   }
 
@@ -123,7 +150,13 @@ export async function retrieveEvidence(
   // handing that unrelated rule to the generator as additional context.
   const topicRelevant = filterTopicRelevant(ordered, query);
   const candidates = topicRelevant.length > 0 ? topicRelevant : ordered;
-  const { chunks, rerankerFailed } = await rerankOrKeepOrder(query, candidates, reranker, options);
+  const { chunks, rerankerFailed, reason: rerankReason } = await rerankOrKeepOrder(
+    query,
+    candidates,
+    reranker,
+    options,
+  );
+  if (rerankReason) degradedReasons.push(rerankReason);
   const finalChunks = chunks.slice(0, FINAL_LIMIT);
   // MVP threshold: non-exact evidence must have a real lexical rank in the
   // top five. Vector-only hits are useful candidates but not strong enough to
@@ -139,10 +172,7 @@ export async function retrieveEvidence(
     chunks: finalChunks,
     usedKeywordFallback,
     rerankerFailed,
-    degradedReasons: [
-      ...(usedKeywordFallback ? ['embedding_unavailable_keyword_fallback'] : []),
-      ...(rerankerFailed ? ['reranker_unavailable_order_preserved'] : []),
-    ],
+    degradedReasons,
     evidenceStrength: hasKeywordEvidence ? 'keyword' : 'weak',
     hasAcceptableEvidence: hasKeywordEvidence,
   };
@@ -185,19 +215,48 @@ function containsCorpusAnchor(query: string): boolean {
   );
 }
 
+/** Raised internally when no budget is left for the optional embedding stage. */
+class EmbeddingSkippedError extends ProviderUnavailableError {}
+
+async function embedQuery(
+  query: string,
+  embedder: EmbeddingClient,
+  options: RetrievalOptions,
+): Promise<readonly number[] | null> {
+  if (!options.budget) {
+    const [vector] = await embedder.embed([query], { signal: options.signal });
+    return vector ?? null;
+  }
+  const budgetMs = options.budget.auxiliaryStageMs();
+  if (budgetMs <= 0) throw new EmbeddingSkippedError('No budget left for query embedding');
+  const [vector] = await runWithinStageBudget('embedding', budgetMs, options.signal, (signal) =>
+    embedder.embed([query], { signal, timeoutMs: budgetMs }),
+  );
+  return vector ?? null;
+}
+
 async function rerankOrKeepOrder(
   query: string,
   chunks: readonly RetrievedChunk[],
   reranker: RerankerClient,
-  options: ProviderCallOptions,
-): Promise<{ chunks: readonly RetrievedChunk[]; rerankerFailed: boolean }> {
+  options: RetrievalOptions,
+): Promise<{ chunks: readonly RetrievedChunk[]; rerankerFailed: boolean; reason?: string }> {
   if (chunks.length === 0) return { chunks, rerankerFailed: false };
+  const passages = chunks.map((retrieved) => retrieved.chunk.searchText);
+  const budgetMs = options.budget?.auxiliaryStageMs();
+  // Reranking only refines the order. When the remaining request time must be
+  // kept for generation, keep the rank-fusion order instead of risking a blank
+  // failure after the whole budget was spent on an optional stage.
+  if (budgetMs !== undefined && budgetMs <= 0) {
+    return { chunks, rerankerFailed: true, reason: 'reranker_skipped_budget' };
+  }
   try {
-    const scores = await reranker.rerank(
-      query,
-      chunks.map((retrieved) => retrieved.chunk.searchText),
-      options,
-    );
+    const scores =
+      budgetMs === undefined
+        ? await reranker.rerank(query, passages, { signal: options.signal })
+        : await runWithinStageBudget('reranking', budgetMs, options.signal, (signal) =>
+            reranker.rerank(query, passages, { signal, timeoutMs: budgetMs }),
+          );
     const scored = chunks.map((retrieved, index) => ({
       ...retrieved,
       rerankerScore: scores[index] ?? 0,
@@ -211,6 +270,13 @@ async function rerankOrKeepOrder(
   } catch (error) {
     if (options.signal?.aborted) throw error;
     if (!(error instanceof ProviderUnavailableError)) throw error;
-    return { chunks, rerankerFailed: true };
+    return {
+      chunks,
+      rerankerFailed: true,
+      reason:
+        error instanceof StageBudgetExceededError
+          ? 'reranker_timeout_order_preserved'
+          : 'reranker_unavailable_order_preserved',
+    };
   }
 }

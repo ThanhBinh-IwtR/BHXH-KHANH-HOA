@@ -5,12 +5,25 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PublicResponse } from '@/features/legal-rag/public-response';
 
 import {
+  CHAT_STAGES,
   MAX_HISTORY_TURNS,
   MAX_STORED_MESSAGES,
   SESSION_STORAGE_KEY,
   type ChatMessage,
   type ChatProgress,
+  type ChatStage,
 } from './chat-types';
+import { readServerSentEvents } from './server-sent-events';
+
+/**
+ * Client-side ceiling. The server budget is at most 60 s (REQUEST_TIMEOUT_MS
+ * is capped there), so this only fires if the server or the connection hangs.
+ */
+const CLIENT_TIMEOUT_MS = 75_000;
+const CLIENT_TIMEOUT_MESSAGE =
+  'Máy chủ không phản hồi trong thời gian cho phép. Vui lòng thử lại sau.';
+const STREAM_INTERRUPTED_MESSAGE =
+  'Kết nối bị gián đoạn trước khi nhận được câu trả lời. Vui lòng thử lại.';
 
 function newId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -19,6 +32,8 @@ function newId(): string {
 export interface ChatSession {
   messages: ChatMessage[];
   progress: ChatProgress;
+  /** Latest real pipeline milestone reported by the server, if it streams. */
+  stage: ChatStage | null;
   error: string | null;
   send: (message: string) => Promise<void>;
   retry: () => Promise<void>;
@@ -55,11 +70,43 @@ function isPublicResponse(value: unknown): value is PublicResponse {
   );
 }
 
+function isChatStage(value: unknown): value is ChatStage {
+  return typeof value === 'string' && (CHAT_STAGES as readonly string[]).includes(value);
+}
+
+/** Consume the event stream until the final answer or a classified error. */
+async function readStreamedAnswer(
+  body: ReadableStream<Uint8Array>,
+  onStage: (stage: ChatStage) => void,
+): Promise<unknown> {
+  for await (const { event, data } of readServerSentEvents(body)) {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (event === 'stage') {
+      const stage = (payload as { stage?: unknown }).stage;
+      if (isChatStage(stage)) onStage(stage);
+    } else if (event === 'result') {
+      return payload;
+    } else if (event === 'error') {
+      const message = (payload as { message?: unknown }).message;
+      throw new Error(typeof message === 'string' ? message : 'Đã xảy ra lỗi khi xử lý câu hỏi.');
+    }
+  }
+  throw new Error(STREAM_INTERRUPTED_MESSAGE);
+}
+
 export function useChatSession(): ChatSession {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [progress, setProgress] = useState<ChatProgress>('idle');
+  const [stage, setStage] = useState<ChatStage | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  // Owned by exactly one in-flight request. Checked synchronously, so two
+  // submissions in the same tick cannot both start (state would still read idle).
+  const activeRequestRef = useRef<AbortController | null>(null);
   const pendingRequestRef = useRef<PendingRequest | null>(null);
 
   // Hydrate from sessionStorage (never localStorage) on mount.
@@ -97,8 +144,11 @@ export function useChatSession(): ChatSession {
       history: HistoryTurn[],
       { appendUserMessage = true }: SubmitOptions = {},
     ) => {
-      if (!message || progress !== 'idle') return;
+      if (!message || activeRequestRef.current) return;
+      const controller = new AbortController();
+      activeRequestRef.current = controller;
       setError(null);
+      setStage(null);
       pendingRequestRef.current = { message, history };
 
       if (appendUserMessage) {
@@ -106,14 +156,20 @@ export function useChatSession(): ChatSession {
         setMessages((current) => [...current, userMessage]);
       }
 
-      const controller = new AbortController();
-      abortRef.current = controller;
       setProgress('processing');
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, CLIENT_TIMEOUT_MS);
 
       try {
         const res = await fetch('/api/chat', {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            accept: 'text/event-stream, application/json',
+          },
           body: JSON.stringify({ message, history }),
           signal: controller.signal,
         });
@@ -139,10 +195,16 @@ export function useChatSession(): ChatSession {
                 : 'Đã xảy ra lỗi khi xử lý câu hỏi.'),
           );
         }
-        const answer: unknown = await res.json();
+        const streamed = res.headers.get('content-type')?.includes('text/event-stream') && res.body;
+        const answer: unknown = streamed
+          ? await readStreamedAnswer(res.body!, (next) => {
+              if (activeRequestRef.current === controller) setStage(next);
+            })
+          : await res.json();
         if (!isPublicResponse(answer)) {
           throw new Error('Phản hồi từ máy chủ không hợp lệ. Vui lòng thử lại.');
         }
+        if (activeRequestRef.current !== controller) return;
         setMessages((current) => [
           ...current,
           {
@@ -155,14 +217,23 @@ export function useChatSession(): ChatSession {
         ]);
         pendingRequestRef.current = null;
       } catch (caught) {
+        if (timedOut) {
+          if (activeRequestRef.current === controller) setError(CLIENT_TIMEOUT_MESSAGE);
+          return;
+        }
         if (controller.signal.aborted) return;
         setError(toUserError(caught));
       } finally {
-        setProgress('idle');
-        abortRef.current = null;
+        clearTimeout(timer);
+        // A cancelled request must not reset the state of a newer one.
+        if (activeRequestRef.current === controller) {
+          activeRequestRef.current = null;
+          setProgress('idle');
+          setStage(null);
+        }
       }
     },
-    [progress],
+    [],
   );
 
   const send = useCallback(
@@ -184,11 +255,12 @@ export function useChatSession(): ChatSession {
   }, [progress, submit]);
 
   const cancel = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    activeRequestRef.current?.abort();
+    activeRequestRef.current = null;
     pendingRequestRef.current = null;
     setError(null);
     setProgress('idle');
+    setStage(null);
   }, []);
 
   const newChat = useCallback(() => {
@@ -208,9 +280,9 @@ export function useChatSession(): ChatSession {
     setMessages(restored.slice(-MAX_STORED_MESSAGES));
   }, []);
 
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => () => activeRequestRef.current?.abort(), []);
 
-  return { messages, progress, error, send, retry, cancel, newChat, clearSession, restore };
+  return { messages, progress, stage, error, send, retry, cancel, newChat, clearSession, restore };
 }
 
 function toUserError(error: unknown): string {

@@ -5,11 +5,48 @@ import type { LegalChunk, RetrievedChunk, SearchQuery } from '@/features/legal-r
 
 import {
   RepositoryUnavailableError,
+  throwIfRepositoryCallAborted,
   type ExactReference,
   type LegalDocument,
   type LegalRepository,
+  type RepositoryCallOptions,
 } from './legal-repository';
 import { removeAccents } from './text';
+
+/**
+ * Columns of the `legal_chunk_rows` view. The view joins the document number
+ * and title (which `legal_chunks` does not store) and never exposes the
+ * 1024-dimension `embedding` column, so no vector payload crosses the network.
+ */
+const CHUNK_COLUMNS = [
+  'chunk_id',
+  'document_id',
+  'document_number',
+  'document_title',
+  'context_header',
+  'body_text',
+  'search_text',
+  'search_text_unaccented',
+  'chapter_number',
+  'section_number',
+  'article_number',
+  'article_title',
+  'clause_number',
+  'point_from',
+  'point_to',
+  'page_from',
+  'page_to',
+  'parent_id',
+  'previous_sibling_id',
+  'next_sibling_id',
+  'cross_reference_ids',
+  'token_count',
+  'corpus_version',
+  'chunk_type',
+].join(', ');
+
+const DEFAULT_QUERY_TIMEOUT_MS = 10_000;
+const DOCUMENTS_CACHE_TTL_MS = 5 * 60_000;
 
 const chunkRowSchema = z.object({
   chunk_id: z.string(),
@@ -90,18 +127,29 @@ export interface SupabaseRepositoryOptions {
   serviceKey: string;
   corpusVersion: string;
   client?: SupabaseClient;
+  /** Upper bound for one PostgREST call, independent of the request signal. */
+  queryTimeoutMs?: number;
+  /** Test hook for the documents cache clock. */
+  now?: () => number;
 }
 
 /**
  * Production repository backed by Supabase PostgreSQL. Every network failure is
  * remapped to RepositoryUnavailableError so provider internals never surface.
+ * Every call carries an AbortSignal so a cancelled or timed-out request stops
+ * the HTTP call to PostgREST instead of leaving it running in the background.
  */
 export class SupabaseLegalRepository implements LegalRepository {
   private readonly client: SupabaseClient;
   private readonly corpusVersion: string;
+  private readonly queryTimeoutMs: number;
+  private readonly now: () => number;
+  private documentsCache: { value: readonly LegalDocument[]; expiresAt: number } | null = null;
 
   constructor(options: SupabaseRepositoryOptions) {
     this.corpusVersion = options.corpusVersion;
+    this.queryTimeoutMs = options.queryTimeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS;
+    this.now = options.now ?? Date.now;
     this.client =
       options.client ??
       createClient(options.url, options.serviceKey, {
@@ -109,15 +157,24 @@ export class SupabaseLegalRepository implements LegalRepository {
       });
   }
 
-  async getDocuments(): Promise<readonly LegalDocument[]> {
+  async getDocuments(options?: RepositoryCallOptions): Promise<readonly LegalDocument[]> {
+    throwIfRepositoryCallAborted(options);
+    // Four nearly static rows: cache them so opening a citation does not cost
+    // an extra round-trip. A newly activated corpus appears within the TTL.
+    if (this.documentsCache && this.documentsCache.expiresAt > this.now()) {
+      return this.documentsCache.value;
+    }
+    const signal = this.callSignal(options);
     const { data, error } = await this.client
       .from('legal_documents')
       .select(
         'document_id, document_number, document_type, title, issued_date, effective_date, corpus_version, pdf_url',
       )
-      .eq('corpus_version', this.corpusVersion);
-    if (error) throw new RepositoryUnavailableError();
-    return z
+      .eq('corpus_version', this.corpusVersion)
+      .eq('status', 'active')
+      .abortSignal(signal);
+    if (error) throw this.unavailable(signal);
+    const documents = z
       .array(documentRowSchema)
       .parse(data ?? [])
       .map((row) => ({
@@ -130,43 +187,60 @@ export class SupabaseLegalRepository implements LegalRepository {
         corpusVersion: row.corpus_version,
         pdfUrl: row.pdf_url,
       }));
+    this.documentsCache = { value: documents, expiresAt: this.now() + DOCUMENTS_CACHE_TTL_MS };
+    return documents;
   }
 
-  async getSource(chunkId: string): Promise<LegalChunk | null> {
+  async getSource(chunkId: string, options?: RepositoryCallOptions): Promise<LegalChunk | null> {
+    const signal = this.callSignal(options);
     const { data, error } = await this.client
-      .from('legal_chunks')
-      .select('*')
+      .from('legal_chunk_rows')
+      .select(CHUNK_COLUMNS)
       .eq('chunk_id', chunkId)
       .eq('status', 'active')
+      .abortSignal(signal)
       .maybeSingle();
-    if (error) throw new RepositoryUnavailableError();
+    if (error) throw this.unavailable(signal);
     if (!data) return null;
     return toChunk(chunkRowSchema.parse(data));
   }
 
-  async exactSearch(reference: ExactReference): Promise<readonly LegalChunk[]> {
-    const { data, error } = await this.client.rpc('exact_search_legal_chunks', {
-      document_number: reference.documentNumber,
-      article_number: reference.article,
-      clause_number: reference.clause ?? null,
-      point_number: reference.point ?? null,
-      corpus_version: this.corpusVersion,
-    });
-    if (error) throw new RepositoryUnavailableError();
+  async exactSearch(
+    reference: ExactReference,
+    options?: RepositoryCallOptions,
+  ): Promise<readonly LegalChunk[]> {
+    const signal = this.callSignal(options);
+    const { data, error } = await this.client
+      .rpc('exact_search_legal_chunks', {
+        document_number: reference.documentNumber,
+        article_number: reference.article,
+        clause_number: reference.clause ?? null,
+        point_number: reference.point ?? null,
+        corpus_version: this.corpusVersion,
+      })
+      .abortSignal(signal);
+    if (error) throw this.unavailable(signal);
     return z
       .array(chunkRowSchema)
       .parse(data ?? [])
       .map(toChunk);
   }
 
-  async keywordSearch(query: string, limit: number): Promise<readonly RetrievedChunk[]> {
-    const { data, error } = await this.client.rpc('keyword_search_legal_chunks', {
-      query_text: query,
-      query_unaccented: removeAccents(query),
-      match_count: limit,
-      corpus_version: this.corpusVersion,
-    });
-    if (error) throw new RepositoryUnavailableError();
+  async keywordSearch(
+    query: string,
+    limit: number,
+    options?: RepositoryCallOptions,
+  ): Promise<readonly RetrievedChunk[]> {
+    const signal = this.callSignal(options);
+    const { data, error } = await this.client
+      .rpc('keyword_search_legal_chunks', {
+        query_text: query,
+        query_unaccented: removeAccents(query),
+        match_count: limit,
+        corpus_version: this.corpusVersion,
+      })
+      .abortSignal(signal);
+    if (error) throw this.unavailable(signal);
     return z
       .array(rankedRowSchema)
       .parse(data ?? [])
@@ -180,15 +254,21 @@ export class SupabaseLegalRepository implements LegalRepository {
       }));
   }
 
-  async hybridSearch(input: SearchQuery): Promise<readonly RetrievedChunk[]> {
-    const { data, error } = await this.client.rpc('hybrid_search_legal_chunks', {
-      query_text: input.queryText,
-      query_unaccented: input.queryUnaccented,
-      query_embedding: input.queryVector ?? null,
-      match_count: input.matchCount,
-      corpus_version: input.corpusVersion,
-    });
-    if (error) throw new RepositoryUnavailableError();
+  async hybridSearch(
+    input: SearchQuery,
+    options?: RepositoryCallOptions,
+  ): Promise<readonly RetrievedChunk[]> {
+    const signal = this.callSignal(options);
+    const { data, error } = await this.client
+      .rpc('hybrid_search_legal_chunks', {
+        query_text: input.queryText,
+        query_unaccented: input.queryUnaccented,
+        query_embedding: input.queryVector ?? null,
+        match_count: input.matchCount,
+        corpus_version: input.corpusVersion,
+      })
+      .abortSignal(signal);
+    if (error) throw this.unavailable(signal);
     return z
       .array(rankedRowSchema)
       .parse(data ?? [])
@@ -202,17 +282,38 @@ export class SupabaseLegalRepository implements LegalRepository {
       }));
   }
 
-  async getRelated(chunkIds: readonly string[]): Promise<readonly LegalChunk[]> {
+  async getRelated(
+    chunkIds: readonly string[],
+    options?: RepositoryCallOptions,
+  ): Promise<readonly LegalChunk[]> {
+    throwIfRepositoryCallAborted(options);
     if (chunkIds.length === 0) return [];
+    const signal = this.callSignal(options);
     const { data, error } = await this.client
-      .from('legal_chunks')
-      .select('*')
+      .from('legal_chunk_rows')
+      .select(CHUNK_COLUMNS)
       .in('chunk_id', [...chunkIds])
-      .eq('status', 'active');
-    if (error) throw new RepositoryUnavailableError();
+      .eq('status', 'active')
+      .abortSignal(signal);
+    if (error) throw this.unavailable(signal);
     return z
       .array(chunkRowSchema)
       .parse(data ?? [])
       .map(toChunk);
+  }
+
+  /** Combine the request signal with a per-call ceiling. */
+  private callSignal(options: RepositoryCallOptions = {}): AbortSignal {
+    throwIfRepositoryCallAborted(options);
+    const timeout = AbortSignal.timeout(this.queryTimeoutMs);
+    return options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+  }
+
+  private unavailable(signal: AbortSignal): RepositoryUnavailableError {
+    return new RepositoryUnavailableError(
+      signal.aborted
+        ? 'Legal repository call was cancelled or timed out'
+        : 'Legal repository is temporarily unavailable',
+    );
   }
 }

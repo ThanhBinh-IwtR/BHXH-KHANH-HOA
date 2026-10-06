@@ -58,7 +58,6 @@ export interface VerifiedAnswer {
   shortAnswer: string;
   shortAnswerSourceIds?: readonly string[];
   analysis: readonly VerifiedClaim[];
-  aiSupplement: string | null;
   missingInformation: readonly string[];
   followUpQuestion: string | null;
 }

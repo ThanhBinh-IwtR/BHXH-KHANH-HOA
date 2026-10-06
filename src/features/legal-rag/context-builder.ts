@@ -1,4 +1,4 @@
-import type { LegalRepository } from '@/lib/db/legal-repository';
+import type { LegalRepository, RepositoryCallOptions } from '@/lib/db/legal-repository';
 import { compareLegalChunks } from '@/lib/db/text';
 
 import type { EvidenceSet } from './retrieval';
@@ -53,6 +53,7 @@ export async function buildContext(
   evidence: EvidenceSet,
   repository: LegalRepository,
   budget: ContextBudget = DEFAULT_BUDGET,
+  options: RepositoryCallOptions = {},
 ): Promise<BuiltContext> {
   const primary = evidence.chunks.map((retrieved) => retrieved.chunk);
 
@@ -71,7 +72,7 @@ export async function buildContext(
 
   const primaryDocumentIds = new Set(primary.map((chunk) => chunk.documentId));
   const primaryCorpusVersions = new Set(primary.map((chunk) => chunk.corpusVersion));
-  const relatedCandidates = relatedIds.size > 0 ? await repository.getRelated([...relatedIds]) : [];
+  const relatedCandidates = relatedIds.size > 0 ? await repository.getRelated([...relatedIds], options) : [];
   const related = relatedCandidates.filter(
     (chunk) =>
       chunk.chunkType !== 'appendix' &&

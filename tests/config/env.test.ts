@@ -19,7 +19,7 @@ const validEnv = {
   RERANKER_BASE_URL: 'https://router.huggingface.co',
   RERANKER_API_KEY: 'reranker-key',
   RERANKER_MODEL: 'BAAI/bge-reranker-v2-m3',
-  AI_TIMEOUT_MS: '30000',
+  AI_TIMEOUT_MS: '15000',
   RATE_LIMIT_SALT: 'rate-limit-salt',
 };
 
@@ -44,7 +44,7 @@ describe('getServerEnv', () => {
     expect(getServerEnv()).toMatchObject({
       legalRepository: 'memory',
       corpusVersion: '2025-demo-v1',
-      aiTimeoutMs: 30000,
+      aiTimeoutMs: 15000,
       llm: {
         baseUrl: 'https://openrouter.ai/api/v1',
         apiKey: 'llm-key',
@@ -121,6 +121,18 @@ describe('getServerEnv', () => {
       requestTimeoutMs: 25000,
       rateLimit: { max: 20, windowMs: 60000 },
     });
+  });
+
+  it('rejects a provider timeout above 60% of the request budget', () => {
+    replaceEnv({ ...validEnv, AI_TIMEOUT_MS: '60000', REQUEST_TIMEOUT_MS: '60000' });
+
+    expect(() => getServerEnv()).toThrow(/AI_TIMEOUT_MS.*60% of REQUEST_TIMEOUT_MS/);
+  });
+
+  it('accepts the documented demo timeouts (36 s provider, 60 s request)', () => {
+    replaceEnv({ ...validEnv, AI_TIMEOUT_MS: '36000', REQUEST_TIMEOUT_MS: '60000' });
+
+    expect(getServerEnv()).toMatchObject({ aiTimeoutMs: 36000, requestTimeoutMs: 60000 });
   });
 
   it('supports a 60-second request budget for slower free providers', () => {

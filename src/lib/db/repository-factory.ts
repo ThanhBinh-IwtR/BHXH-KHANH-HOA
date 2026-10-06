@@ -22,7 +22,7 @@ export function getLegalRepository(): LegalRepository {
       });
       break;
     case 'memory':
-      cached = new MemoryLegalRepository(sampleCorpus);
+      cached = new MemoryLegalRepository(sampleCorpus, { corpusVersion: env.corpusVersion });
       break;
     default: {
       const impossibleRepository: never = env.legalRepository;

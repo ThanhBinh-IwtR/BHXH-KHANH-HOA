@@ -111,3 +111,99 @@ một người đối chiếu trang gốc, thêm mục vào `reviewed_low_confid
 
 `document_sha256` và `observed_confidence` phải khớp chính xác, nếu không CLI coi là
 `review_metadata_mismatch` và vẫn chặn.
+
+## 6. Publish corpus lên Supabase
+
+Ba subcommand mới đưa một artifact đã `is_valid: true` lên Supabase. Không lệnh nào sửa PDF hay
+nội dung pháp lý; lệnh chỉ đọc artifact, manifest và `.env`, không in secret.
+
+### Điều kiện trước
+
+- Đã áp dụng **cả hai** migration trong `supabase/migrations/` (xem [deployment.md](deployment.md)).
+- `.env` có `SUPABASE_URL`, `SUPABASE_SERVICE_KEY` (service role) và bộ `EMBEDDING_*` dùng được
+  (`npm run provider:readiness` không còn `403`).
+- `CORPUS_VERSION` trong `.env` trùng `corpus_version` của artifact và manifest.
+
+### Thứ tự chạy
+
+```powershell
+$env:PYTHONPATH = "$PWD"
+$artifact = "data/corpus/task4-consistent"
+
+# 1. Ghi cross_reference_ids đã resolve vào chunks.jsonl (chỉ cần cho artifact tạo trước 2026-09-19;
+#    lệnh validate mới đã tự ghi). Chạy lại là no-op; file được thay thế nguyên tử.
+python -m ingestion.legal_ingestion.cli link-references --artifact-dir $artifact
+
+# 2. Sinh embedding cho 632 chunk quy phạm (phụ lục không cần). Cache nằm cạnh artifact:
+#    embeddings-<model>.jsonl. Lỗi giữa chừng -> chạy lại lệnh, chỉ batch còn thiếu được gọi.
+python -m ingestion.legal_ingestion.cli embed --artifact-dir $artifact `
+  --manifest-dir ingestion/manifests --env-file .env
+
+# 3. Kiểm tra toàn bộ điều kiện cục bộ, không gọi database.
+python -m ingestion.legal_ingestion.cli publish --artifact-dir $artifact `
+  --manifest-dir ingestion/manifests --env-file .env --dry-run
+
+# 4. Publish thật.
+python -m ingestion.legal_ingestion.cli publish --artifact-dir $artifact `
+  --manifest-dir ingestion/manifests --env-file .env
+```
+
+`publish` làm theo thứ tự: (a) từ chối sớm nếu thiếu embedding hoặc phiên bản đang `active` có nội dung
+khác; (b) chèn document mới ở `staged` (bản ghi đã có giữ nguyên); (c) upsert chunk theo batch **không gửi
+cột `status`**, nên chunk mới là `staged` và chunk đang phục vụ không đổi trạng thái; (d) gọi RPC
+`activate_legal_corpus`, trong **một transaction** kiểm tra số chunk/embedding, cập nhật metadata văn
+bản, bật corpus mới `active`, hạ mọi chunk `active` khác xuống `inactive` và ghi `ingestion_runs`
+(kèm `artifact_sha256`). Lỗi ở (b)–(c) để lại hàng `staged` vô hại; lỗi ở (d) rollback toàn bộ.
+
+Cờ tùy chọn:
+
+- `--allow-missing-embeddings`: publish corpus chỉ có keyword (nhánh vector rỗng). Chỉ dùng khi
+  provider embedding chưa dùng được và cần chạy thử exact/keyword trên dữ liệu thật.
+- `--allow-in-place-update`: ghi đè một phiên bản đang `active` có nội dung khác. Mặc định bị từ chối vì
+  upsert trực tiếp sẽ thay nội dung đang phục vụ trước bước activate — nên đổi `CORPUS_VERSION` thay vì dùng cờ này.
+
+Publish lại **đúng artifact đó** là idempotent: không tạo bản ghi trùng, không đổi trạng thái đang phục vụ
+(so khớp `artifact_sha256` của lần activate gần nhất).
+
+### Kiểm tra sau publish
+
+```sql
+select count(*) from legal_chunks where status = 'active' and chunk_type = 'normative';  -- 632
+select chunk_id, page_from from exact_search_legal_chunks('188/2025/NĐ-CP', '7', '1', null, '2025-demo-v1');
+select count(*) filter (where vector_rank is not null)
+from hybrid_search_legal_chunks('mức đóng bảo hiểm y tế', 'muc dong bao hiem y te',
+  (select embedding from legal_chunks where status = 'active' and embedding is not null limit 1),
+  10, '2025-demo-v1');  -- > 0
+```
+
+Sau đó đổi `.env` sang `LEGAL_REPOSITORY=supabase`, khởi động lại server và chạy `npm run evaluate`.
+
+### Rollback
+
+Publish lại artifact của phiên bản trước (cùng lệnh, với artifact/manifest cũ) sẽ kích hoạt lại phiên bản
+đó trong một transaction. Khẩn cấp có thể đổi `LEGAL_REPOSITORY=memory` rồi khởi động lại.
+
+### Giới hạn đã biết
+
+- `legal_documents` dùng khóa `document_id`, nên mỗi văn bản chỉ có một bản ghi metadata: chỉ một phiên
+  bản corpus `active` tại một thời điểm, và đổi phiên bản cần đổi `CORPUS_VERSION` của ứng dụng.
+- Bảng `legal_cross_references` chưa được ghi; ứng dụng chỉ dùng cột `cross_reference_ids`.
+- 634 `parent_id` trỏ tới chunk cấp Điều không tồn tại (Điều đã tách theo Khoản); context builder bỏ qua
+  an toàn.
+
+### Kiểm chứng cục bộ ngày 2026-09-19
+
+Chưa có credential Supabase, nên migration và lệnh publish được chạy trên PostgreSQL 16 + pgvector cục bộ
+(gói `pgserver`, `unaccent` giả lập bằng `translate()`, bỏ index trigram vì không có `pg_trgm`) với đúng
+artifact 649 chunk và embedding giả 1024 chiều:
+
+| Kiểm tra | Kết quả |
+| --- | --- |
+| Publish lần 1 | 649 chunk `active` (632 quy phạm), 4 văn bản `active`, ≈5,5 giây |
+| Publish lần 2 cùng artifact | vẫn 649 hàng, 0 chunk đổi trạng thái |
+| Lỗi giả lập ở batch thứ 5 khi publish `v2` | `v1` vẫn 649 `active`; `v2` chỉ có 200 hàng `staged` |
+| Chuyển `v2` ↔ `v1` | mỗi lần đúng 649 `active`, phiên bản kia `inactive` |
+| Exact search cả bốn nghị định | 157 Đ2 K1, 158 Đ12 K3, 159 Đ5, 188 Đ7 K1 đều trả chunk và trang |
+| Nhánh vector của hybrid search | khác rỗng; chunk có embedding trùng query xếp hạng 1 |
+
+Đây là bằng chứng cho SQL và luồng publish, **không** thay cho lần publish thật lên Supabase.

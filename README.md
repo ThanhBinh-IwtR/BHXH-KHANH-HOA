@@ -2,8 +2,8 @@
 
 Ứng dụng web responsive giúp tra cứu và phân tích quy định bảo hiểm xã hội và bảo hiểm y tế
 từ một corpus pháp lý cố định gồm **bốn nghị định** (157, 158, 159, 188 / 2025 / NĐ-CP).
-Hệ thống trả lời ngắn gọn trước, phân tích kèm **căn cứ có thể mở và kiểm tra lại**, tách rõ phần
-có căn cứ khỏi phần AI bổ sung, và từ chối kết luận khi dữ liệu không đủ.
+Hệ thống trả lời ngắn gọn trước, phân tích kèm **căn cứ có thể mở và kiểm tra lại**, chỉ hiển thị
+những mệnh đề đối chiếu được với nguồn, và từ chối kết luận khi dữ liệu không đủ.
 
 > **Trạng thái:** MVP/DEMO phục vụ cuộc thi nội bộ. Dự án ưu tiên trải nghiệm trình diễn,
 > độ tin cậy và hiệu năng hợp lý; chưa được định vị là hệ thống tư vấn pháp lý production.
@@ -113,7 +113,7 @@ npm run test:e2e
 
 - [Abstract.md](Abstract.md) — knowledge base trung tâm: mục tiêu, phạm vi, kiến trúc, trạng thái và định hướng dự án.
 - [TODO-MVP-DEMO.md](TODO-MVP-DEMO.md) — backlog cần theo dõi và hoàn thành cho bản dự thi.
-- [docs/operations/ingestion.md](docs/operations/ingestion.md) — OCR cục bộ, chạy pipeline và quality gate.
+- [docs/operations/ingestion.md](docs/operations/ingestion.md) — OCR cục bộ, chạy pipeline, quality gate và publish corpus lên Supabase.
 - [docs/operations/deployment.md](docs/operations/deployment.md) — Supabase, publish corpus và rollback.
 - [docs/operations/evaluation.md](docs/operations/evaluation.md) — gold set, chạy đánh giá và so sánh model.
 - [Thiết kế kỹ thuật gốc](docs/superpowers/specs/2026-07-21-legal-insurance-rag-design.md) — đặc tả chi tiết dùng làm tài liệu tham chiếu.

@@ -26,6 +26,7 @@ export function ChatComposer({ onSend, onCancel, progress }: ChatComposerProps) 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
+      // While a request runs the draft is kept; it can be sent once it finishes.
       if (!busy) submit(event);
     }
   };
@@ -43,8 +44,16 @@ export function ChatComposer({ onSend, onCancel, progress }: ChatComposerProps) 
         rows={1}
         onChange={(event) => setValue(event.target.value)}
         onKeyDown={onKeyDown}
-        disabled={busy}
+        // Never `disabled`: disabling the focused field would drop keyboard
+        // focus to <body> for the whole 20-50 s wait. Submission is blocked
+        // instead, and the next question can already be drafted.
+        aria-describedby={busy ? 'chat-input-busy' : undefined}
       />
+      {busy && (
+        <span id="chat-input-busy" className="sr-only">
+          Đang xử lý câu hỏi trước; có thể soạn tiếp câu hỏi mới và gửi khi hoàn tất.
+        </span>
+      )}
       {busy ? (
         <button type="button" className="composer-button" onClick={onCancel} aria-label="Hủy yêu cầu">
           <Square size={18} aria-hidden />

@@ -7,7 +7,6 @@ describe('answerSchema', () => {
       scope_status: 'grounded',
       short_answer: 'Có căn cứ.',
       analysis: [{ claim: 'Quy định áp dụng.', source_ids: ['nd158-2025:dieu-1:khoan-1:v1'] }],
-      ai_supplement: null,
       missing_information: [],
       follow_up_question: null,
     }).scope_status).toBe('grounded');
@@ -17,7 +16,7 @@ describe('answerSchema', () => {
     expect(() => answerSchema.parse({
       scope_status: 'grounded', short_answer: 'Sai',
       analysis: [{ claim: 'Không nguồn', source_ids: [] }],
-      ai_supplement: null, missing_information: [], follow_up_question: null,
+      missing_information: [], follow_up_question: null,
     })).toThrow();
   });
 
@@ -26,7 +25,6 @@ describe('answerSchema', () => {
       scope_status: 'grounded',
       short_answer: 'Sai',
       analysis: [],
-      ai_supplement: null,
       missing_information: [],
       follow_up_question: null,
     })).toThrow();
@@ -40,7 +38,6 @@ describe('answerSchema', () => {
         claim: `Mệnh đề ${index}`,
         source_ids: ['source'],
       })),
-      ai_supplement: null,
       missing_information: [],
       follow_up_question: null,
     })).toThrow();

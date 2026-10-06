@@ -2,10 +2,11 @@
 
 ## 1. Schema
 
-Áp dụng migration một lần lên Supabase PostgreSQL:
+Áp dụng lần lượt hai migration lên Supabase PostgreSQL:
 
 ```
 supabase/migrations/202607210001_legal_corpus.sql
+supabase/migrations/202609190001_publish_and_search.sql
 ```
 
 Migration bật `vector`, `pg_trgm`, `unaccent`; tạo năm bảng (`legal_documents`, `legal_nodes`,
@@ -13,6 +14,17 @@ Migration bật `vector`, `pg_trgm`, `unaccent`; tạo năm bảng (`legal_docum
 cosine `vector(1024)`; định nghĩa RPC `exact_search_legal_chunks`, `keyword_search_legal_chunks`,
 `hybrid_search_legal_chunks` (RRF). Quyền ghi trực tiếp bị thu hồi khỏi `anon`/`authenticated` —
 runtime chỉ ghi bằng service key phía server.
+
+Migration `202609190001` (bắt buộc cho Supabase):
+
+- View `legal_chunk_rows` nối số hiệu/tiêu đề văn bản và **không** chứa cột `embedding`. Trước đây
+  `getSource`, `getRelated` và exact search đọc thẳng `legal_chunks` (không có `document_number`) nên
+  đường Supabase không parse được kết quả.
+- Cột sinh `search_tsv` + GIN index; keyword search dùng truy vấn OR trên các từ của câu hỏi và yêu cầu ít
+  nhất hai từ khớp (giống memory repository). Truy vấn AND cũ trả 0 kết quả cho câu hỏi tự nhiên.
+- Hybrid search truy vấn thẳng bảng gốc ở cả hai nhánh để GIN và HNSW dùng được; bỏ điều kiện trigram
+  `%` (ngưỡng 0,3 gần như không bao giờ khớp câu hỏi ngắn với chunk dài).
+- RPC `activate_legal_corpus` cho lệnh publish (xem [ingestion.md](ingestion.md) mục 6).
 
 ## 2. Biến môi trường production
 
@@ -39,14 +51,14 @@ CORPUS_VERSION=2025-demo-v1
 LLM_BASE_URL=<url>
 LLM_API_KEY=<key>
 LLM_MODEL=<model>
-LLM_MAX_OUTPUT_TOKENS=1024
+LLM_MAX_OUTPUT_TOKENS=2048
 EMBEDDING_BASE_URL=<url>
 EMBEDDING_API_KEY=<key>
 EMBEDDING_MODEL=<model>
 RERANKER_BASE_URL=<url>
 RERANKER_API_KEY=<key>
 RERANKER_MODEL=<model>
-AI_TIMEOUT_MS=50000
+AI_TIMEOUT_MS=36000
 REQUEST_TIMEOUT_MS=60000
 RATE_LIMIT_MAX=20
 RATE_LIMIT_WINDOW_MS=60000
@@ -64,6 +76,22 @@ npm run build
 # Xác nhận không có key trong client assets
 Select-String -Path .next/static/**/*.js -Pattern "SUPABASE_SERVICE_KEY|sk-" -List
 ```
+
+### Ngân sách thời gian theo stage
+
+`REQUEST_TIMEOUT_MS` là deadline tổng của một câu hỏi và được chia cho từng stage:
+
+| Stage | Ngân sách | Khi không đủ |
+| --- | --- | --- |
+| Embedding câu hỏi | ≤ 15% deadline tổng | hết giờ → keyword fallback (`embedding_timeout_keyword_fallback`) |
+| Rerank | ≤ 15% deadline tổng, và chỉ chạy nếu còn ≥ 50% deadline | bỏ qua, giữ thứ tự RRF (`reranker_skipped_budget` / `reranker_timeout_order_preserved`) |
+| Generation | toàn bộ thời gian còn lại, trừ ≤ 1 giây dự phòng cho verification | không còn thời gian → lỗi `provider_timeout` ngay, không gọi provider |
+
+`AI_TIMEOUT_MS` là trần cho **một** lời gọi provider và phải ≤ 60% `REQUEST_TIMEOUT_MS`
+(15% + 15% + 60% còn 10% dự phòng); `env.ts` từ chối cấu hình vi phạm ngay khi khởi động. Demo dùng
+36000/60000. Embedding/rerank chia ngân sách stage cho hai attempt (attempt đầu tối đa một nửa) để còn
+chỗ cho retry; generation không cắt attempt đầu, vì cắt ngắn một lượt sinh chậm không làm lượt retry nhanh hơn.
+Mọi lời gọi Supabase cũng nhận `AbortSignal` của request và có trần 10 giây mỗi lời gọi.
 
 Lời gọi provider có tối đa một retry transport có kiểm soát cho 5xx/network/timeout; 429 chỉ retry khi
 provider gửi `Retry-After` và còn đủ ngân sách. OpenAI SDK không được phép retry thêm. `REQUEST_TIMEOUT_MS`
@@ -84,17 +112,15 @@ và các request sau dùng keyword fallback, không lặp lại HTTP request ch�
 
 ## 3. Publish corpus mới (atomic + versioned)
 
-1. Chạy ingestion (xem [ingestion.md](ingestion.md)) tới khi report `is_valid: true`.
-2. Nạp `chunks.jsonl` vào `legal_chunks` với `status = 'staged'` và `corpus_version` mới.
-3. Sinh embedding cho các chunk staged; nếu embedding lỗi giữa chừng, **không** publish.
-4. Trong một transaction: đặt corpus mới `status = 'active'`, corpus cũ `status = 'inactive'`.
-5. Ghi một dòng `ingestion_runs` với report.
-
-Nếu bất kỳ bước nào lỗi, corpus đang `active` giữ nguyên — người dùng không thấy trạng thái nửa vời.
+Dùng lệnh `link-references` → `embed` → `publish --dry-run` → `publish` của
+`ingestion.legal_ingestion.cli`; runbook đầy đủ ở [ingestion.md](ingestion.md) mục 6. Chunk được nạp ở
+`staged`, rồi RPC `activate_legal_corpus` bật corpus mới và hạ corpus cũ trong **một transaction** và
+ghi `ingestion_runs`. Nếu bất kỳ bước nào lỗi, corpus đang `active` giữ nguyên — người dùng không thấy
+trạng thái nửa vời.
 
 ## 4. Rollback
 
-Để quay lại phiên bản corpus trước:
+Cách ưu tiên: chạy lại `publish` với artifact của phiên bản trước. Thủ công bằng SQL:
 
 ```sql
 update legal_chunks set status = 'inactive' where corpus_version = '<phiên bản lỗi>';
@@ -115,3 +141,10 @@ npm run start   # mặc định cổng 3000
 Ba route API (`/api/chat`, `/api/documents`, `/api/sources/[id]`) chạy trên Node runtime và
 chỉ chấp nhận same-origin. `/api/sources/:id` dựng URL PDF từ bản ghi tài liệu tin cậy, không
 bao giờ từ tham số người dùng.
+
+- `POST /api/chat` trả JSON như trước; nếu request có `Accept: text/event-stream` (UI luôn gửi), route
+  phát các sự kiện `stage` (`retrieval`, `context`, `generation`, `verification`) theo tiến trình thật, rồi
+  đúng một sự kiện `result` (cùng body JSON) hoặc `error` (`{ code, message, status }`). Hủy fetch sẽ abort
+  pipeline và lời gọi provider. Proxy đứng trước server không được buffer `text/event-stream`.
+- `GET /corpus/:filename` stream PDF, hỗ trợ `Range` (`206 Partial Content`, `Accept-Ranges: bytes`,
+  `416` khi vượt cuối file) và `HEAD`; không nạp cả file vào RAM.

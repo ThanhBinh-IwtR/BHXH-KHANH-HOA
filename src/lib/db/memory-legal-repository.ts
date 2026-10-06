@@ -1,6 +1,12 @@
 import type { LegalChunk, RetrievedChunk, SearchQuery } from '@/features/legal-rag/types';
 
-import type { ExactReference, LegalDocument, LegalRepository } from './legal-repository';
+import {
+  throwIfRepositoryCallAborted,
+  type ExactReference,
+  type LegalDocument,
+  type LegalRepository,
+  type RepositoryCallOptions,
+} from './legal-repository';
 import { compareLegalChunks, removeAccents } from './text';
 
 export interface LegalCorpusData {
@@ -13,26 +19,42 @@ export interface LegalCorpusData {
  * unit/integration test. It intentionally mirrors the ordering rules of the
  * Supabase RPC so that swapping backends never changes observable behaviour.
  */
+export interface MemoryRepositoryOptions {
+  /**
+   * Corpus version served by keyword search, mirroring the Supabase repository.
+   * Omit only in fixtures that deliberately mix versions.
+   */
+  corpusVersion?: string;
+}
+
 export class MemoryLegalRepository implements LegalRepository {
   private readonly documents: readonly LegalDocument[];
   private readonly chunks: readonly LegalChunk[];
   private readonly byId: Map<string, LegalChunk>;
+  private readonly corpusVersion: string | undefined;
 
-  constructor(data: LegalCorpusData) {
+  constructor(data: LegalCorpusData, options: MemoryRepositoryOptions = {}) {
     this.documents = [...data.documents];
     this.chunks = [...data.chunks];
     this.byId = new Map(this.chunks.map((chunk) => [chunk.chunkId, chunk]));
+    this.corpusVersion = options.corpusVersion;
   }
 
-  async getDocuments(): Promise<readonly LegalDocument[]> {
+  async getDocuments(options?: RepositoryCallOptions): Promise<readonly LegalDocument[]> {
+    throwIfRepositoryCallAborted(options);
     return [...this.documents].sort((a, b) => (a.documentNumber < b.documentNumber ? -1 : 1));
   }
 
-  async getSource(chunkId: string): Promise<LegalChunk | null> {
+  async getSource(chunkId: string, options?: RepositoryCallOptions): Promise<LegalChunk | null> {
+    throwIfRepositoryCallAborted(options);
     return this.byId.get(chunkId) ?? null;
   }
 
-  async exactSearch(reference: ExactReference): Promise<readonly LegalChunk[]> {
+  async exactSearch(
+    reference: ExactReference,
+    options?: RepositoryCallOptions,
+  ): Promise<readonly LegalChunk[]> {
+    throwIfRepositoryCallAborted(options);
     const normalizedDoc = normalizeDocumentNumber(reference.documentNumber);
     const matches = this.chunks.filter((chunk) => {
       if (chunk.chunkType === 'appendix') return false;
@@ -45,8 +67,13 @@ export class MemoryLegalRepository implements LegalRepository {
     return [...matches].sort(compareLegalChunks);
   }
 
-  async keywordSearch(query: string, limit: number): Promise<readonly RetrievedChunk[]> {
-    const scored = this.scoreKeyword(query);
+  async keywordSearch(
+    query: string,
+    limit: number,
+    options?: RepositoryCallOptions,
+  ): Promise<readonly RetrievedChunk[]> {
+    throwIfRepositoryCallAborted(options);
+    const scored = this.scoreKeyword(query, this.corpusVersion);
     return scored.slice(0, limit).map(({ chunk }, index) => ({
       chunk,
       exactMatch: false,
@@ -57,7 +84,11 @@ export class MemoryLegalRepository implements LegalRepository {
     }));
   }
 
-  async hybridSearch(input: SearchQuery): Promise<readonly RetrievedChunk[]> {
+  async hybridSearch(
+    input: SearchQuery,
+    options?: RepositoryCallOptions,
+  ): Promise<readonly RetrievedChunk[]> {
+    throwIfRepositoryCallAborted(options);
     const keyword = this.scoreKeyword(input.queryText, input.corpusVersion);
     const keywordRankById = new Map(keyword.map(({ chunk }, index) => [chunk.chunkId, index + 1]));
 
@@ -91,7 +122,11 @@ export class MemoryLegalRepository implements LegalRepository {
     return fused.slice(0, input.matchCount);
   }
 
-  async getRelated(chunkIds: readonly string[]): Promise<readonly LegalChunk[]> {
+  async getRelated(
+    chunkIds: readonly string[],
+    options?: RepositoryCallOptions,
+  ): Promise<readonly LegalChunk[]> {
+    throwIfRepositoryCallAborted(options);
     const result: LegalChunk[] = [];
     const seen = new Set<string>();
     for (const id of chunkIds) {

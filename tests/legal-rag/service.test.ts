@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import type { LlmClient } from '@/lib/ai/contracts';
-import { runRag, type RagServiceDeps } from '@/features/legal-rag/service';
+import type { LlmCallOptions, LlmClient } from '@/lib/ai/contracts';
+import { ModelOutputTruncatedError } from '@/lib/ai/errors';
+import {
+  getRagFailureDiagnostics,
+  runRag,
+  type RagServiceDeps,
+} from '@/features/legal-rag/service';
 import { MemoryLegalRepository } from '@/lib/db/memory-legal-repository';
 import { sampleCorpus, sampleCorpusVersion } from '@/lib/db/sample-corpus';
 
@@ -18,7 +23,34 @@ class CapturingGenerator implements LlmClient {
       scope_status: 'grounded',
       short_answer: 'Người sử dụng lao động đóng 17%.',
       analysis: [{ claim: 'Tỷ lệ đóng là 17%.', source_ids: [SOURCE_ID] }],
-      ai_supplement: null,
+      missing_information: [],
+      follow_up_question: null,
+    } as T;
+  }
+}
+
+class TruncatingLlm implements LlmClient {
+  calls = 0;
+  async generateStructured<T>(
+    _input: { system: string; user: string; schemaName: string },
+    options?: LlmCallOptions,
+  ): Promise<T> {
+    this.calls += 1;
+    options?.onUsage?.({ finishReason: 'length', completionTokens: 2048 });
+    throw new ModelOutputTruncatedError();
+  }
+}
+
+class UsageReportingLlm implements LlmClient {
+  async generateStructured<T>(
+    _input: { system: string; user: string; schemaName: string },
+    options?: LlmCallOptions,
+  ): Promise<T> {
+    options?.onUsage?.({ finishReason: 'stop', completionTokens: 612 });
+    return {
+      scope_status: 'grounded',
+      short_answer: 'Người sử dụng lao động đóng 17%.',
+      analysis: [{ claim: 'Tỷ lệ đóng là 17%.', source_ids: [SOURCE_ID] }],
       missing_information: [],
       follow_up_question: null,
     } as T;
@@ -42,7 +74,6 @@ describe('runRag conversation question', () => {
         scope_status: 'grounded',
         short_answer: 'Người sử dụng lao động đóng 17%.',
         analysis: [{ claim: 'Tỷ lệ đóng là 17%.', source_ids: [SOURCE_ID] }],
-        ai_supplement: null,
         missing_information: [],
         follow_up_question: null,
       },
@@ -61,7 +92,7 @@ describe('runRag conversation question', () => {
     });
   });
 
-  it('restores grounded answer depth after validation removes one shallow claim', async () => {
+  it('restores answer depth but downgrades to partial after validation rejects a claim', async () => {
     const generator = new FakeLlm([
       {
         scope_status: 'grounded',
@@ -80,7 +111,6 @@ describe('runRag conversation question', () => {
             source_ids: [SOURCE_ID],
           },
         ],
-        ai_supplement: null,
         missing_information: [],
         follow_up_question: null,
       },
@@ -91,10 +121,16 @@ describe('runRag conversation question', () => {
       deps(generator),
     );
 
-    expect(result.response.scopeStatus).toBe('grounded');
+    // Decision (P1-07): a rejected model claim means the full answer was not
+    // verified, so the badge drops to partial even though depth is restored.
+    expect(result.response.scopeStatus).toBe('partial');
     expect(result.response.analysis.length).toBeGreaterThanOrEqual(3);
     expect(result.response.shortAnswer).toMatch(/số tiền thực tế|căn cứ/i);
+    expect(result.response.shortAnswer).toMatch(/chỉ hỗ trợ một phần/i);
     expect(result.metrics).toMatchObject({ llmCallCount: 1, rejectedClaimCount: 1 });
+    expect(result.metrics.downgradeReasons).toEqual(
+      expect.arrayContaining(['validator_numeric_mismatch', 'grounded_downgraded_to_partial']),
+    );
   });
 
   it('fails closed with a public safe answer after one malformed model response', async () => {
@@ -123,7 +159,6 @@ describe('runRag conversation question', () => {
             source_ids: [SOURCE_ID],
           },
         ],
-        ai_supplement: null,
         missing_information: [],
         follow_up_question: null,
       },
@@ -262,7 +297,6 @@ describe('runRag conversation question', () => {
         scope_status: 'grounded',
         short_answer: 'Người sử dụng lao động đóng 17%.',
         analysis: [{ claim: 'Tỷ lệ đóng là 17%.', source_ids: [SOURCE_ID] }],
-        ai_supplement: null,
         missing_information: [],
         follow_up_question: null,
       },
@@ -278,5 +312,55 @@ describe('runRag conversation question', () => {
     expect(result.response.scopeStatus).toBe('grounded');
     expect(result.metrics.llmCallCount).toBe(1);
     expect(generator.calls).toBe(1);
+  });
+  it('surfaces output truncation as a classified error, never as out_of_scope', async () => {
+    const generator = new TruncatingLlm();
+    const error = await runRag(
+      { message: 'Khoản 3 Điều 12 Nghị định 158/2025/NĐ-CP quy định gì?', history: [] },
+      deps(generator),
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ModelOutputTruncatedError);
+    expect(generator.calls).toBe(1);
+    expect(getRagFailureDiagnostics(error)).toMatchObject({
+      stage: 'generation',
+      reason: 'output_truncated',
+      metrics: {
+        llmCallCount: 1,
+        finishReason: 'length',
+        completionTokens: 2048,
+        downgradeReasons: expect.arrayContaining(['output_truncated']),
+      },
+    });
+  });
+
+  it('records the provider stop reason and completion tokens of a successful call', async () => {
+    const result = await runRag(
+      { message: 'Khoản 3 Điều 12 Nghị định 158/2025/NĐ-CP quy định gì?', history: [] },
+      deps(new UsageReportingLlm()),
+    );
+
+    expect(result.metrics).toMatchObject({ finishReason: 'stop', completionTokens: 612 });
+  });
+
+  it('labels a model out-of-scope decision separately from schema and truncation failures', async () => {
+    const generator = new FakeLlm([
+      {
+        scope_status: 'out_of_scope',
+        short_answer: 'Không có căn cứ.',
+        analysis: [],
+        missing_information: [],
+        follow_up_question: null,
+      },
+    ]);
+    const result = await runRag(
+      { message: 'Khoản 3 Điều 12 Nghị định 158/2025/NĐ-CP quy định gì?', history: [] },
+      deps(generator),
+    );
+
+    expect(result.response.scopeStatus).toBe('out_of_scope');
+    expect(result.metrics.downgradeReasons).toContain('model_out_of_scope');
+    expect(result.metrics.downgradeReasons).not.toContain('invalid_model_output');
+    expect(result.metrics.downgradeReasons).not.toContain('output_truncated');
   });
 });

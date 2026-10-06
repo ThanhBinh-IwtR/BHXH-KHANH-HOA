@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
 
 import { sampleCorpusVersion } from '@/lib/db/sample-corpus';
-import type { LegalRepository } from '@/lib/db/legal-repository';
+import { RepositoryUnavailableError, type LegalRepository } from '@/lib/db/legal-repository';
 
 /**
  * Behavioural contract that every LegalRepository implementation must satisfy.
@@ -61,5 +61,32 @@ export function repositoryContract(factory: () => LegalRepository): void {
     const documents = await factory().getDocuments();
     expect(documents).toHaveLength(4);
     expect(documents.map((doc) => doc.documentNumber)).toContain('157/2025/NĐ-CP');
+  });
+
+  it('rejects every call whose request was already cancelled', async () => {
+    const repository = factory();
+    const controller = new AbortController();
+    controller.abort();
+    const options = { signal: controller.signal };
+    const calls = [
+      repository.getDocuments(options),
+      repository.getSource('nd-159-2025:dieu-5:khoan-1:2025-demo-v1', options),
+      repository.exactSearch({ documentNumber: '158/2025/NĐ-CP', article: '12' }, options),
+      repository.keywordSearch('muc dong bao hiem y te', 10, options),
+      repository.hybridSearch(
+        {
+          queryText: 'mức đóng bảo hiểm y tế',
+          queryUnaccented: 'muc dong bao hiem y te',
+          queryVector: null,
+          matchCount: 5,
+          corpusVersion: sampleCorpusVersion,
+        },
+        options,
+      ),
+      repository.getRelated(['nd-159-2025:dieu-5:khoan-1:2025-demo-v1'], options),
+    ];
+    for (const call of calls) {
+      await expect(call).rejects.toBeInstanceOf(RepositoryUnavailableError);
+    }
   });
 }

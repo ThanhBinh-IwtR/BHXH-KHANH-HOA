@@ -29,4 +29,34 @@ describe('ChatComposer', () => {
     await userEvent.click(cancel);
     expect(onCancel).toHaveBeenCalled();
   });
+
+  it('keeps keyboard focus in the field for the whole request (never disabled)', async () => {
+    const onSend = vi.fn();
+    const { rerender } = render(<ChatComposer onSend={onSend} onCancel={() => {}} progress="idle" />);
+    const input = screen.getByLabelText(/nhập câu hỏi về bhxh/i);
+    await userEvent.type(input, 'Câu hỏi đầu{Enter}');
+
+    rerender(<ChatComposer onSend={onSend} onCancel={() => {}} progress="processing" />);
+
+    expect(input).not.toBeDisabled();
+    expect(input).toHaveFocus();
+    rerender(<ChatComposer onSend={onSend} onCancel={() => {}} progress="idle" />);
+    expect(input).toHaveFocus();
+  });
+
+  it('lets the user draft the next question but only sends it after the request ends', async () => {
+    const onSend = vi.fn();
+    const { rerender } = render(
+      <ChatComposer onSend={onSend} onCancel={() => {}} progress="processing" />,
+    );
+    const input = screen.getByLabelText(/nhập câu hỏi về bhxh/i);
+
+    await userEvent.type(input, 'Câu hỏi tiếp theo{Enter}');
+    expect(onSend).not.toHaveBeenCalled();
+    expect(input).toHaveValue('Câu hỏi tiếp theo');
+
+    rerender(<ChatComposer onSend={onSend} onCancel={() => {}} progress="idle" />);
+    await userEvent.type(input, '{Enter}');
+    expect(onSend).toHaveBeenCalledWith('Câu hỏi tiếp theo');
+  });
 });

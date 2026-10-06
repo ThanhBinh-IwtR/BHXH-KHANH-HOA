@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -10,11 +11,28 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .chunking import DocumentManifest, LegalChunkRecord, build_chunks
-from .cross_references import resolve_cross_references
+from .cross_references import attach_cross_reference_ids, resolve_cross_references
+from .embeddings import (
+    EmbeddingError,
+    HuggingFaceEmbeddingProvider,
+    current_embeddings,
+    embed_chunks,
+    embedding_cache_path,
+)
+from .env import load_env_file, require_env
 from .extract_pdf import extract_pages
 from .models import PageText, ParseResult
 from .ocr import OcrEngine, TesseractOcrEngine
 from .parse_structure import parse_pages
+from .publish import (
+    PostgrestGateway,
+    PublishBlocked,
+    PublishError,
+    PublishOptions,
+    link_references_in_place,
+    load_artifact,
+    publish_corpus,
+)
 from .quality import (
     LowOcrConfidenceError,
     OcrConfidenceFailure,
@@ -227,6 +245,7 @@ def validate_command(
                         )
                     )
             references = resolve_cross_references(chunks)
+            chunks = attach_cross_reference_ids(chunks, references)
             all_chunks.extend(chunks)
             inputs.append(
                 DocumentValidationInput(
@@ -288,18 +307,64 @@ def _hash_matches(path: Path, expected: str) -> bool:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate the approved legal corpus")
+    parser = argparse.ArgumentParser(description="Validate and publish the approved legal corpus")
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate = subparsers.add_parser("validate")
     validate.add_argument("--corpus-dir", type=Path, required=True)
     validate.add_argument("--manifest-dir", type=Path, required=True)
     validate.add_argument("--output-dir", type=Path, required=True)
     validate.add_argument("--run-id")
+
+    link = subparsers.add_parser(
+        "link-references",
+        help="write resolved cross_reference_ids into an existing chunks.jsonl",
+    )
+    link.add_argument("--artifact-dir", type=Path, required=True)
+
+    embed = subparsers.add_parser(
+        "embed", help="embed normative chunks into a resumable cache next to the artifact"
+    )
+    embed.add_argument("--artifact-dir", type=Path, required=True)
+    embed.add_argument("--manifest-dir", type=Path, required=True)
+    embed.add_argument("--embeddings-cache", type=Path)
+    embed.add_argument("--batch-size", type=int, default=16)
+    embed.add_argument("--env-file", type=Path)
+
+    publish = subparsers.add_parser(
+        "publish", help="stage the artifact in Supabase and activate it atomically"
+    )
+    publish.add_argument("--artifact-dir", type=Path, required=True)
+    publish.add_argument("--manifest-dir", type=Path, required=True)
+    publish.add_argument("--embeddings-cache", type=Path)
+    publish.add_argument("--batch-size", type=int, default=50)
+    publish.add_argument("--env-file", type=Path)
+    publish.add_argument("--run-id")
+    publish.add_argument(
+        "--allow-missing-embeddings",
+        action="store_true",
+        help="publish a keyword-only corpus (vector search stays empty)",
+    )
+    publish.add_argument(
+        "--allow-in-place-update",
+        action="store_true",
+        help="rewrite an already active corpus version that has different content",
+    )
+    publish.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="run every local check and print the plan without contacting Supabase",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.command == "link-references":
+        return _link_references(args)
+    if args.command == "embed":
+        return _embed(args)
+    if args.command == "publish":
+        return _publish(args)
     try:
         path = validate_command(
             corpus_dir=args.corpus_dir,
@@ -314,6 +379,103 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Report: {error.failed_path / 'validation-report.json'}")
         return 2
     print(f"VALID: {path}")
+    return 0
+
+
+def _link_references(args: argparse.Namespace) -> int:
+    total, linked = link_references_in_place(args.artifact_dir)
+    print(f"LINKED: {linked}/{total} chunks have resolved cross_reference_ids")
+    return 0
+
+
+def _embed(args: argparse.Namespace) -> int:
+    if args.env_file:
+        load_env_file(args.env_file)
+    try:
+        provider = HuggingFaceEmbeddingProvider(
+            base_url=require_env("EMBEDDING_BASE_URL"),
+            api_key=require_env("EMBEDDING_API_KEY"),
+            model=require_env("EMBEDDING_MODEL"),
+        )
+        artifact = load_artifact(args.artifact_dir, load_manifests(args.manifest_dir))
+    except (KeyError, PublishBlocked) as error:
+        print(f"BLOCKED: {error}")
+        return 2
+    cache_path = args.embeddings_cache or embedding_cache_path(args.artifact_dir, provider.model)
+    try:
+        summary = embed_chunks(
+            artifact.chunks,
+            provider,
+            cache_path,
+            batch_size=args.batch_size,
+            on_batch=lambda done, total: print(f"embedded {done}/{total}", flush=True),
+        )
+    except EmbeddingError as error:
+        print(f"FAILED: {error} (completed batches are cached; re-run to resume)")
+        return 3
+    print(
+        f"EMBEDDED: model={summary.model} normative={summary.normative_chunks} "
+        f"reused={summary.reused} new={summary.embedded} cache={summary.cache_path}"
+    )
+    return 0
+
+
+def _publish(args: argparse.Namespace) -> int:
+    if args.env_file:
+        load_env_file(args.env_file)
+    try:
+        manifests = load_manifests(args.manifest_dir)
+        artifact = load_artifact(args.artifact_dir, manifests)
+    except PublishBlocked as error:
+        print(f"BLOCKED: {error}")
+        return 2
+    model = os.environ.get("EMBEDDING_MODEL", "").strip()
+    cache_path = args.embeddings_cache or (
+        embedding_cache_path(args.artifact_dir, model) if model else None
+    )
+    embeddings = (
+        current_embeddings(artifact.normative_chunks, cache_path, model=model)
+        if cache_path is not None and model
+        else {}
+    )
+    normative = len(artifact.normative_chunks)
+    print(
+        f"ARTIFACT: version={artifact.corpus_version} chunks={len(artifact.chunks)} "
+        f"normative={normative} documents={len(artifact.document_ids)} "
+        f"embedded={len(embeddings)}/{normative} fingerprint={artifact.fingerprint[:16]}"
+    )
+    if artifact.references_linked_at_load:
+        print("NOTE: cross_reference_ids were resolved at load time (run link-references to persist them)")
+    if args.dry_run:
+        missing = normative - len(embeddings)
+        if missing and not args.allow_missing_embeddings:
+            print(f"DRY-RUN BLOCKED: {missing} normative chunks have no embedding")
+            return 2
+        print("DRY-RUN OK: no database call was made")
+        return 0
+    try:
+        gateway = PostgrestGateway(require_env("SUPABASE_URL"), require_env("SUPABASE_SERVICE_KEY"))
+        summary = publish_corpus(
+            artifact,
+            manifests,
+            gateway,
+            embeddings,
+            PublishOptions(
+                require_embeddings=not args.allow_missing_embeddings,
+                allow_in_place_update=args.allow_in_place_update,
+                batch_size=args.batch_size,
+                run_id=args.run_id,
+                embedding_model=model or None,
+            ),
+            log=lambda message: print(message, flush=True),
+        )
+    except (KeyError, PublishBlocked) as error:
+        print(f"BLOCKED: {error}")
+        return 2
+    except PublishError as error:
+        print(f"FAILED: {error} (the previously active corpus is unchanged)")
+        return 3
+    print(f"ACTIVE: run={summary.run_id} {json.dumps(dict(summary.activation), ensure_ascii=False)}")
     return 0
 
 

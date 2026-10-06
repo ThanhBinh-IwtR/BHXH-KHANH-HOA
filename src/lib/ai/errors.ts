@@ -20,6 +20,19 @@ export class InvalidModelOutputError extends Error {
   }
 }
 
+/**
+ * Raised when the provider stopped because the output-token limit was reached
+ * (`finish_reason: "length"`) and the partial payload is unusable. Kept apart
+ * from a genuine schema failure so a length problem is never shown to the user
+ * as "out of scope".
+ */
+export class ModelOutputTruncatedError extends InvalidModelOutputError {
+  constructor(message = 'Model output was cut off by the output-token limit') {
+    super(message);
+    this.name = 'ModelOutputTruncatedError';
+  }
+}
+
 /** Read provider metadata without exposing the original error to callers. */
 export function getProviderStatus(error: unknown): number | undefined {
   if (!error || typeof error !== 'object') return undefined;

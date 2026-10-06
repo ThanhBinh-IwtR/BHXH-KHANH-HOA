@@ -5,6 +5,14 @@ export interface TimeoutOptions {
   timeoutMs: number;
   /** Retry once on transient 5xx/network/timeout failures. Default true. */
   retry?: boolean;
+  /**
+   * Cap for every attempt except the last one, so a hung first attempt still
+   * leaves budget for the permitted retry. The last attempt always receives
+   * whatever remains of the stage budget. Omit it to let the first attempt use
+   * the full budget (appropriate for long generations, where cutting an attempt
+   * short never makes the retry faster).
+   */
+  attemptTimeoutMs?: number;
   /** Parent request signal; aborting it stops the current attempt and backoff. */
   signal?: AbortSignal;
 }
@@ -143,9 +151,14 @@ export async function withTimeout<T>(
     }
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) break;
+    const isLastAttempt = attempt + 1 >= attempts;
+    const attemptMs =
+      isLastAttempt || options.attemptTimeoutMs === undefined
+        ? remainingMs
+        : Math.min(remainingMs, Math.max(1, options.attemptTimeoutMs));
 
     try {
-      return await runAttempt(operation, options.signal, remainingMs);
+      return await runAttempt(operation, options.signal, attemptMs);
     } catch (error) {
       lastError = error;
       if (options.signal?.aborted) {

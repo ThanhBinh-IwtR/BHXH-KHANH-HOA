@@ -91,15 +91,21 @@ So sánh `A.json` và `B.json` theo `exactLookupAccuracy`, `recallAt10`, `scopeA
 
 ## 5. Ngân sách câu trả lời dài
 
-Demo hiện đặt `LLM_MAX_OUTPUT_TOKENS=1024` trong `.env` và có cấu hình gợi ý tương ứng trong `.env.example`.
+Demo hiện đặt `LLM_MAX_OUTPUT_TOKENS=2048` trong `.env` và có cấu hình gợi ý tương ứng trong `.env.example`
+(1024 nằm sát mép cho JSON grounded 250–450 từ kèm source ID dài). Khi provider dừng vì hết token
+(`finish_reason: "length"`) và JSON bị cắt, pipeline trả lỗi `output_truncated` (HTTP 502, có nút thử lại)
+thay vì fallback "Ngoài phạm vi tài liệu"; log ghi `finishReason` và `completionTokens`. Báo cáo
+`npm run evaluate` có thêm cột `Stop`/`Tokens`, dòng `Max completion tokens` và coi bất kỳ case bị cắt nào
+là thất bại. `ai_supplement` đã bị bỏ khỏi prompt/schema vì không bao giờ được hiển thị.
 Prompt yêu cầu câu trả lời
 grounded khoảng 250–450 từ, kết luận 2–4 câu và tối đa 3–5 mục phân tích độc lập khi ngữ cảnh đủ căn cứ;
 mọi claim vẫn phải có `source_ids` hợp lệ và đi qua validator/verifier deterministic. Không có lượt semantic
 verifier LLM thứ hai.
 
-Timeout provider của demo là 50 giây (`AI_TIMEOUT_MS`), còn deadline toàn pipeline là 60 giây
-(`REQUEST_TIMEOUT_MS`). Đây là headroom tạm thời cho tail latency của provider, không phải bằng chứng rằng
-provider đã đạt p95 mục tiêu; cần restart dev server sau khi đổi `.env`. Lỗi timeout trả thông báo rằng AI
+Timeout một lời gọi provider của demo là 36 giây (`AI_TIMEOUT_MS`, tối đa 60% deadline), còn deadline toàn
+pipeline là 60 giây (`REQUEST_TIMEOUT_MS`); embedding và rerank mỗi stage tối đa 15% (xem
+[deployment.md](deployment.md)). Đây không phải bằng chứng rằng provider đã đạt p95 mục tiêu; cần restart
+dev server sau khi đổi `.env`. Lỗi timeout trả thông báo rằng AI
 provider chưa phản hồi và log server ghi stage timing đã loại bỏ nội dung câu hỏi/câu trả lời. Retry phía UI
 dùng lại user bubble hiện tại để không tạo message trùng hoặc gọi nhầm nhiều lượt ngoài chủ ý.
 
